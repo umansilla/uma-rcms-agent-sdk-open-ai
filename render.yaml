@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: avaya-rcms-openai-bridge
+    runtime: python
+    plan: starter        # Free plan spins down after inactivity — unsuitable for real-time calls
+    region: oregon       # us-west-2; change to frankfurt / singapore as needed
+
+    buildCommand: pip install -r requirements.txt
+    # Render terminates TLS at the load balancer → the app runs plain HTTP/WS internally.
+    # Avaya connects to wss://<your-service>.onrender.com/media-stream
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT --log-level info
+
+    healthCheckPath: /
+
+    envVars:
+      # ── Python version ──────────────────────────────────────────────
+      - key: PYTHON_VERSION
+        value: 3.11.11
+
+      # ── OpenAI ─────────────────────────────────────────────────────
+      - key: OPENAI_API_KEY
+        sync: false          # Secret — set in Render Dashboard > Environment
+
+      - key: OPENAI_REALTIME_MODEL
+        value: gpt-4o-realtime-preview
+
+      # ── Server ─────────────────────────────────────────────────────
+      # PORT is injected automatically by Render; no need to set it here.
+
+      # SSL is handled by Render's proxy — no SSL_CERT / SSL_KEY needed.
+
+      # Prevent uvicorn from spawning multiple workers;
+      # WebSocket connections cannot be distributed without sticky sessions.
+      - key: WEB_CONCURRENCY
+        value: "1"
+
+      # ── Avaya JWT authentication (optional) ────────────────────────
+      - key: ENABLE_AUTH
+        value: "false"       # Set to "true" when Avaya JWT signing is configured
+
+      - key: JWT_SECRET_KEY
+        sync: false          # Required only when ENABLE_AUTH=true
