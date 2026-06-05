@@ -8,8 +8,7 @@ uvicorn[standard]==0.48.0
 
 # OpenAI Agents SDK with Realtime API support
 # openai-agents 0.8.4 requires openai>=2.19.0,<3 — do not pin openai separately
-openai-agents[voice]==0.8.4
-
+openai-agents
 # JWT authentication (for Avaya's signed tokens)
 PyJWT==2.10.1
 
