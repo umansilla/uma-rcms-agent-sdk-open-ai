@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import struct
 import time
+import traceback
 import uuid
 from datetime import datetime, UTC
 from typing import Any
@@ -32,22 +34,30 @@ from agents.realtime import (
 )
 
 # ─────────────────────────────────────────────────────────────────
+# Logger
+# ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("avaya_bridge")
+
+# ─────────────────────────────────────────────────────────────────
 # Binary frame constants
 # ─────────────────────────────────────────────────────────────────
 
-# Magic bytes that identify the old 52-byte Avaya frame format ('AV')
-BINARY_MAGIC = 0x4156
+BINARY_MAGIC = 0x4156   # 'AV' — identifies old 52-byte Avaya frames
 
-# Source enum (compact format, byte 1 of the header)
 SOURCE_NONE = 0
-SOURCE_TX   = 1   # Caller audio flowing TO our server  (egress from Avaya PoV)
-SOURCE_RX   = 2   # Bot audio flowing FROM our server  (ingress from Avaya PoV)
+SOURCE_TX   = 1   # Caller audio → our server   (egress from Avaya PoV)
+SOURCE_RX   = 2   # Bot audio   → caller         (ingress from Avaya PoV)
 
-# Codec IDs (follow RTP standard payload types)
-CODEC_PCMU = 0    # G.711 µ-law  → OpenAI "g711_ulaw" — no conversion needed
+CODEC_PCMU = 0    # G.711 µ-law  ≡ OpenAI "g711_ulaw"
 CODEC_PCMA = 8    # G.711 A-law
 CODEC_G722 = 9
-CODEC_L16  = 11   # Raw signed 16-bit PCM, little-endian
+CODEC_L16  = 11   # Raw signed 16-bit PCM LE
 
 CODEC_NAME_MAP: dict[str, int] = {
     "PCMU": CODEC_PCMU,
@@ -58,47 +68,20 @@ CODEC_NAME_MAP: dict[str, int] = {
 CODEC_ID_TO_NAME: dict[int, str] = {v: k for k, v in CODEC_NAME_MAP.items()}
 
 # ── Old format: 52-byte header (magic = 0x4156) ──────────────────
-#   >HBBHHII16s16sI
-#   H  magic        (2)
-#   B  version      (1)
-#   B  media_type   (1)  0=audio
-#   H  codec_id     (2)
-#   H  flags        (2)
-#   I  timestamp_ms (4)
-#   I  sequence     (4)
-#   16s session_uuid(16)
-#   16s endpoint_uuid(16)
-#   I  payload_len  (4)
-#   ─────────────────────
-#                   52 bytes
 _OLD_FMT        = ">HBBHHII16s16sI"
-OLD_HEADER_SIZE = struct.calcsize(_OLD_FMT)   # must be 52
-
+OLD_HEADER_SIZE = struct.calcsize(_OLD_FMT)   # 52
 FLAG_OLD_LAST_FRAME = 0x02
-FLAG_OLD_SOURCE_TX  = 0x04   # Set when frame carries caller audio
+FLAG_OLD_SOURCE_TX  = 0x04
+assert OLD_HEADER_SIZE == 52
 
-assert OLD_HEADER_SIZE == 52, f"Old header size mismatch: {OLD_HEADER_SIZE}"
-
-# ── Compact format: 16-byte header (no magic) ────────────────────
-#   >BBHIQ
-#   B  bid           (1)   bus-id assigned by Avaya
-#   B  source        (1)   SOURCE_TX=1, SOURCE_RX=2
-#   H  flags         (2)
-#   I  sequence      (4)
-#   Q  timestamp_us  (8)   microseconds (NTP-based, 64-bit)
-#   ─────────────────────
-#                   16 bytes
+# ── Compact format: 16-byte header ───────────────────────────────
+#   B bid(1)  B source(1)  H flags(2)  I seq(4)  Q timestamp_us(8)
 #   Payload = everything after the 16-byte header.
-#   If FLAG_CMP_EXTENSION is set, extension data precedes the payload:
-#     H ext_length (2) + ext_length bytes of extension data.
 _CMP_FMT        = ">BBHIQ"
-CMP_HEADER_SIZE = struct.calcsize(_CMP_FMT)   # must be 16
-
+CMP_HEADER_SIZE = struct.calcsize(_CMP_FMT)   # 16
 FLAG_CMP_LAST_FRAME = 0x0001
 FLAG_CMP_EXTENSION  = 0x0002
-FLAG_CMP_CODEC_CHG  = 0x0004
-
-assert CMP_HEADER_SIZE == 16, f"Compact header size mismatch: {CMP_HEADER_SIZE}"
+assert CMP_HEADER_SIZE == 16
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -106,20 +89,11 @@ assert CMP_HEADER_SIZE == 16, f"Compact header size mismatch: {CMP_HEADER_SIZE}"
 # ─────────────────────────────────────────────────────────────────
 
 def parse_binary_frame(data: bytes) -> dict[str, Any] | None:
-    """Parse an Avaya RCMS binary frame.
-
-    Returns a dict with at least:
-      - is_tx (bool):  True when this frame carries caller audio
-      - is_last (bool): True when this is the last frame of a burst
-      - payload (bytes): raw audio bytes (PCMU / g711_ulaw if negotiated)
-    Returns None if the data cannot be parsed.
-    """
     if len(data) < 2:
         return None
-
     magic = struct.unpack_from(">H", data, 0)[0]
 
-    # ── Old 52-byte format ──────────────────────────────────────
+    # Old 52-byte format
     if magic == BINARY_MAGIC:
         if len(data) < OLD_HEADER_SIZE:
             return None
@@ -127,7 +101,7 @@ def parse_binary_frame(data: bytes) -> dict[str, Any] | None:
          sess_b, ep_b, pl_len) = struct.unpack_from(_OLD_FMT, data, 0)
         payload = data[OLD_HEADER_SIZE: OLD_HEADER_SIZE + pl_len]
         return {
-            "format":      "old",
+            "format":      "old-52",
             "codec_id":    codec_id,
             "is_tx":       bool(flags & FLAG_OLD_SOURCE_TX),
             "is_last":     bool(flags & FLAG_OLD_LAST_FRAME),
@@ -138,21 +112,18 @@ def parse_binary_frame(data: bytes) -> dict[str, Any] | None:
             "payload":     payload,
         }
 
-    # ── Compact 16-byte format ──────────────────────────────────
+    # Compact 16-byte format
     if len(data) < CMP_HEADER_SIZE:
         return None
     bid, source, flags, seq, ts_us = struct.unpack_from(_CMP_FMT, data, 0)
-
-    # Skip optional extension block
     offset = CMP_HEADER_SIZE
     if flags & FLAG_CMP_EXTENSION and len(data) >= offset + 2:
         ext_len = struct.unpack_from(">H", data, offset)[0]
         offset += 2 + ext_len
-
     payload = data[offset:]
     return {
-        "format":   "compact",
-        "codec_id": None,         # codec established during session negotiation
+        "format":   "compact-16",
+        "codec_id": None,
         "is_tx":    source == SOURCE_TX,
         "is_last":  bool(flags & FLAG_CMP_LAST_FRAME),
         "ts_us":    ts_us,
@@ -170,15 +141,14 @@ def build_compact_frame(
     seq: int = 0,
     is_last: bool = False,
 ) -> bytes:
-    """Build a compact 16-byte Avaya RCMS binary frame for bot audio (RX/ingress)."""
     flags  = FLAG_CMP_LAST_FRAME if is_last else 0
-    ts_us  = int(time.monotonic() * 1_000_000)   # relative microseconds
+    ts_us  = int(time.monotonic() * 1_000_000)
     header = struct.pack(_CMP_FMT, bid, source, flags, seq, ts_us)
     return header + payload
 
 
 # ─────────────────────────────────────────────────────────────────
-# OpenAI Realtime agent definition
+# OpenAI Realtime agent
 # ─────────────────────────────────────────────────────────────────
 
 @function_tool
@@ -206,74 +176,88 @@ _agent = RealtimeAgent(
 
 
 # ─────────────────────────────────────────────────────────────────
-# Main handler class
+# Main handler
 # ─────────────────────────────────────────────────────────────────
 
 class AvayaHandler:
     """Bridges a single Avaya RCMS WebSocket call to OpenAI Realtime API."""
 
-    # Audio chunking — match OpenAI's preferred 50 ms PCMU/g711_ulaw chunks
-    CHUNK_LENGTH_S = 0.05          # 50 ms
-    SAMPLE_RATE    = 8_000         # PCMU / g711_ulaw at 8 kHz
-    BUFFER_SIZE    = int(SAMPLE_RATE * CHUNK_LENGTH_S)  # 400 bytes
+    CHUNK_LENGTH_S = 0.05
+    SAMPLE_RATE    = 8_000
+    BUFFER_SIZE    = int(SAMPLE_RATE * CHUNK_LENGTH_S)   # 400 bytes = 50 ms PCMU
+
+    # Log binary frame stats every N frames (avoids flooding logs)
+    _BINARY_LOG_EVERY = 200
 
     def __init__(self, websocket: WebSocket) -> None:
         self.ws              = websocket
-        self.session: RealtimeSession | None  = None
-        self.playback_tracker                 = RealtimePlaybackTracker()
+        self.session: RealtimeSession | None = None
+        self.playback_tracker                = RealtimePlaybackTracker()
 
-        # Avaya session metadata
-        self._session_id:   str = ""
-        self._endpoint_id:  str = ""
-        self._bid:          int = 0        # bus-id from compact frames
-        self._codec_id:     int = CODEC_PCMU
+        self._session_id:  str = ""
+        self._endpoint_id: str = ""
+        self._bid:         int = 0
+        self._codec_id:    int = CODEC_PCMU
 
-        # Outbound sequence counter (our frames → Avaya)
-        self._seq_out: int = 0
-
-        # Sequence counter for JSON control messages
+        self._seq_out:  int = 0
         self._json_seq: int = 0
 
-        # Inbound audio buffer (caller → OpenAI)
-        self._audio_buf:   bytearray = bytearray()
-        self._last_flush:  float     = time.monotonic()
+        self._audio_buf:  bytearray = bytearray()
+        self._last_flush: float     = time.monotonic()
 
-        # Background asyncio tasks
+        # Stats
+        self._frames_rx:    int = 0   # binary frames received
+        self._audio_bytes_rx: int = 0   # raw audio bytes from Avaya
+        self._audio_bytes_tx: int = 0   # audio bytes sent to OpenAI
+        self._openai_audio_chunks: int = 0   # audio chunks from OpenAI
+
         self._tasks: list[asyncio.Task] = []
 
     # ── Lifecycle ────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Accept the WebSocket connection."""
+        client = self.ws.client
+        client_addr = f"{client.host}:{client.port}" if client else "unknown"
+        log.info("━━━ New WebSocket connection from %s ━━━", client_addr)
+        log.debug("Headers: %s", dict(self.ws.headers))
         await self.ws.accept()
-        print("[Avaya] WebSocket connection accepted")
+        log.info("WebSocket accepted — waiting for Avaya session.start")
 
     async def wait_until_done(self) -> None:
-        """Drive the session until the WebSocket closes."""
+        log.info("Entering receive loop")
         try:
             while True:
                 raw = await self.ws.receive()
                 event_type = raw.get("type", "")
 
                 if event_type == "websocket.disconnect":
-                    print("[Avaya] Client disconnected")
+                    code   = raw.get("code", "?")
+                    reason = raw.get("reason", "")
+                    log.info("WebSocket disconnected — code=%s reason=%s", code, reason)
                     break
 
                 if "text" in raw and raw["text"]:
                     await self._handle_text(raw["text"])
                 elif "bytes" in raw and raw["bytes"]:
                     await self._handle_binary(raw["bytes"])
+                else:
+                    log.debug("Received empty/unknown frame: type=%s keys=%s",
+                              event_type, list(raw.keys()))
 
         except Exception as exc:
-            print(f"[Avaya] Receive loop error: {exc}")
+            log.error("Receive loop crashed: %s\n%s", exc, traceback.format_exc())
 
     async def cleanup(self) -> None:
-        """Cancel all background tasks."""
+        log.info(
+            "Cleanup — frames_rx=%d  audio_rx=%d B  audio_tx=%d B  openai_chunks=%d",
+            self._frames_rx, self._audio_bytes_rx,
+            self._audio_bytes_tx, self._openai_audio_chunks,
+        )
         for task in self._tasks:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        print("[Avaya] Handler cleaned up")
+        log.info("Handler cleaned up")
 
     # ── JSON / control message handling ─────────────────────────
 
@@ -281,76 +265,72 @@ class AvayaHandler:
         try:
             msg: dict[str, Any] = json.loads(text)
         except json.JSONDecodeError:
-            print(f"[Avaya] Non-JSON text frame: {text[:200]}")
+            log.warning("Received non-JSON text frame: %s", text[:500])
             return
 
-        msg_type = msg.get("type", "")
-        print(f"[Avaya] ← {msg_type}")
+        msg_type = msg.get("type", "<no-type>")
+        log.info("← RECV [%s]", msg_type)
+        log.debug("Full message:\n%s", json.dumps(msg, indent=2))
 
         if msg_type == "session.start":
             await self._on_session_start(msg)
         elif msg_type == "session.end":
             await self._on_session_end(msg)
         elif msg_type.endswith(".start"):
-            # Generic service start — e.g. echo.start, streaming.start, bot.start
             await self._on_service_start(msg)
         elif msg_type.endswith(".end"):
             await self._on_service_end(msg)
         else:
-            print(f"[Avaya] Unhandled control message:\n{json.dumps(msg, indent=2)}")
+            log.warning("Unhandled message type '%s'. Full message:\n%s",
+                        msg_type, json.dumps(msg, indent=2))
 
     async def _on_session_start(self, msg: dict) -> None:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
+        log.info("session.start — sessionId=%s", self._session_id)
 
-        # Negotiate codec from offered mediaEndpoints
         resp_endpoints = []
-        for ep in msg.get("mediaEndpoints", []):
+        for i, ep in enumerate(msg.get("mediaEndpoints", [])):
             ep_id = ep.get("id", str(uuid.uuid4()))
             if not self._endpoint_id:
                 self._endpoint_id = ep_id
 
-            # Parse offered codecs (prefer PCMU for direct OpenAI compatibility)
-            flows        = ep.get("flows", {})
-            audio_flow   = flows.get("audio", {})
-            egress       = audio_flow.get("egress", {})
-            offered      = egress.get("codecs", ["PCMU"])
-            chosen_codec = self._pick_codec(offered)
+            flows      = ep.get("flows", {})
+            audio_flow = flows.get("audio", {})
+            egress     = audio_flow.get("egress", {})
+            offered    = egress.get("codecs", ["PCMU"])
+            chosen     = self._pick_codec(offered)
+
+            log.info(
+                "  endpoint[%d] id=%s  transport=%s  offered_codecs=%s  chosen=%s",
+                i, ep_id, ep.get("transport"), offered, chosen,
+            )
 
             resp_endpoints.append({
                 "id":        ep_id,
                 "transport": ep.get("transport", "binary"),
                 "flows": {
                     "audio": {
-                        "egress": {
-                            "codec":      chosen_codec,
-                            "sampleRate": 8000,
-                        },
-                        "ingress": {
-                            "codec":      chosen_codec,
-                            "sampleRate": 8000,
-                        },
+                        "egress":  {"codec": chosen, "sampleRate": 8000},
+                        "ingress": {"codec": chosen, "sampleRate": 8000},
                     }
                 },
             })
 
         resp: dict[str, Any] = {
-            "version":      msg.get("version", "1.0.0"),
-            "type":         "session.started",
-            "sessionId":    self._session_id,
-            "sequenceNum":  self._next_json_seq(),
-            "timestamp":    _iso_now(),
+            "version":     msg.get("version", "1.0.0"),
+            "type":        "session.started",
+            "sessionId":   self._session_id,
+            "sequenceNum": self._next_json_seq(),
+            "timestamp":   _iso_now(),
         }
         if resp_endpoints:
             resp["mediaEndpoints"] = resp_endpoints
 
+        log.info("→ SEND [session.started]  codec=%s", self._codec_name())
+        log.debug("Full response:\n%s", json.dumps(resp, indent=2))
         await self._send_json(resp)
-        print(
-            f"[Avaya] → session.started  "
-            f"session={self._session_id}  codec={self._codec_name()}"
-        )
 
     async def _on_service_start(self, msg: dict) -> None:
-        """Handle service-specific start (e.g. echo.start, bot.start, streaming.start)."""
         msg_type    = msg.get("type", "")
         session_id  = msg.get("sessionId", self._session_id)
         payload     = msg.get("payload", {})
@@ -360,13 +340,17 @@ class AvayaHandler:
         if endpoint_id and not self._endpoint_id:
             self._endpoint_id = endpoint_id
 
-        print(f"[Avaya] Service start — type={msg_type}  endpoint={endpoint_id}")
+        log.info("Service start — type=%s  service=%s  endpoint=%s",
+                 msg_type, service, endpoint_id)
 
         if self.session is None:
+            log.info("No OpenAI session yet — initializing now")
             await self._start_openai_session()
+        else:
+            log.info("OpenAI session already active")
 
         started_type = msg_type.replace(".start", ".started")
-        await self._send_json({
+        resp = {
             "version":     msg.get("version", "1.0.0"),
             "type":        started_type,
             "sessionId":   session_id,
@@ -374,8 +358,10 @@ class AvayaHandler:
             "timestamp":   _iso_now(),
             "service":     service,
             "payload":     {"endpointId": endpoint_id},
-        })
-        print(f"[Avaya] → {started_type}")
+        }
+        log.info("→ SEND [%s]", started_type)
+        log.debug("Full response:\n%s", json.dumps(resp, indent=2))
+        await self._send_json(resp)
 
     async def _on_service_end(self, msg: dict) -> None:
         msg_type    = msg.get("type", "")
@@ -384,10 +370,10 @@ class AvayaHandler:
         endpoint_id = payload.get("endpointId", self._endpoint_id)
         service     = msg.get("service", msg_type.replace(".end", ""))
 
-        print(f"[Avaya] Service end — type={msg_type}")
+        log.info("Service end — type=%s  endpoint=%s", msg_type, endpoint_id)
 
         ended_type = msg_type.replace(".end", ".ended")
-        await self._send_json({
+        resp = {
             "version":     msg.get("version", "1.0.0"),
             "type":        ended_type,
             "sessionId":   session_id,
@@ -395,89 +381,137 @@ class AvayaHandler:
             "timestamp":   _iso_now(),
             "service":     service,
             "payload":     {"endpointId": endpoint_id},
-        })
-        print(f"[Avaya] → {ended_type}")
+        }
+        log.info("→ SEND [%s]", ended_type)
+        await self._send_json(resp)
 
     async def _on_session_end(self, msg: dict) -> None:
-        await self._send_json({
+        log.info("session.end received — closing")
+        resp = {
             "version":     msg.get("version", "1.0.0"),
             "type":        "session.ended",
             "sessionId":   self._session_id,
             "sequenceNum": self._next_json_seq(),
             "timestamp":   _iso_now(),
-        })
-        print("[Avaya] → session.ended")
+        }
+        log.info("→ SEND [session.ended]")
+        await self._send_json(resp)
 
     # ── Binary frame handling ────────────────────────────────────
 
     async def _handle_binary(self, data: bytes) -> None:
+        self._frames_rx += 1
         frame = parse_binary_frame(data)
+
         if frame is None:
-            print(
-                f"[Avaya] Could not parse binary frame "
-                f"({len(data)} bytes) — first 32 bytes: {data[:32].hex()}"
+            log.warning(
+                "Could not parse binary frame #%d (%d bytes) — hex: %s",
+                self._frames_rx, len(data), data[:64].hex(),
             )
             return
 
-        # Skip frames that we sent (echoed back or RX confirmation)
-        if not frame["is_tx"]:
-            return
+        # Log the very first frame in detail, then periodically
+        if self._frames_rx == 1:
+            log.info(
+                "First binary frame — format=%s  is_tx=%s  codec_id=%s  "
+                "payload=%d B  seq=%s  bid=%s",
+                frame["format"], frame["is_tx"], frame.get("codec_id"),
+                len(frame.get("payload", b"")), frame.get("seq"), frame.get("bid"),
+            )
+            log.debug("First frame raw hex: %s", data[:64].hex())
+        elif self._frames_rx % self._BINARY_LOG_EVERY == 0:
+            log.debug(
+                "Binary frames rx=%d  audio_rx=%d B  audio_tx=%d B  "
+                "openai_chunks=%d  buf=%d B",
+                self._frames_rx, self._audio_bytes_rx,
+                self._audio_bytes_tx, self._openai_audio_chunks,
+                len(self._audio_buf),
+            )
 
-        # Track the bus-id for outbound frames
+        if not frame["is_tx"]:
+            return   # Skip frames we sent (RX / echoed back)
+
         if frame.get("bid") is not None:
             self._bid = frame["bid"]
 
         payload = frame.get("payload", b"")
-        if payload and self.session is not None:
+        if not payload:
+            return
+
+        self._audio_bytes_rx += len(payload)
+
+        if self.session is not None:
             self._audio_buf.extend(payload)
             if len(self._audio_buf) >= self.BUFFER_SIZE:
                 await self._flush_audio()
+        else:
+            if self._frames_rx % self._BINARY_LOG_EVERY == 0:
+                log.debug(
+                    "Audio arriving but OpenAI session not started yet "
+                    "(frames_rx=%d). Waiting for service start message.",
+                    self._frames_rx,
+                )
 
     # ── OpenAI Realtime session ──────────────────────────────────
 
     async def _start_openai_session(self) -> None:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
+            log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
             raise ValueError("OPENAI_API_KEY environment variable is required")
 
         model_name = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+        log.info("Starting OpenAI Realtime session — model=%s", model_name)
 
-        runner = RealtimeRunner(_agent)
-        self.session = await runner.run(
-            model_config={
-                "api_key": api_key,
-                "initial_model_settings": {
-                    "model_name":          model_name,
-                    # PCMU (g711_ulaw) requires no codec conversion — Avaya ↔ OpenAI
-                    "input_audio_format":  "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "turn_detection": {
-                        "type":               "semantic_vad",
-                        "interrupt_response": True,
-                        "create_response":    True,
-                    },
+        model_config = {
+            "api_key": api_key,
+            "initial_model_settings": {
+                "model_name":          model_name,
+                "input_audio_format":  "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+                "turn_detection": {
+                    "type":               "semantic_vad",
+                    "interrupt_response": True,
+                    "create_response":    True,
                 },
-                "playback_tracker": self.playback_tracker,
-            }
-        )
-        await self.session.enter()
-        print(f"[OpenAI] Realtime session started  model={model_name}")
+            },
+            "playback_tracker": self.playback_tracker,
+        }
+        log.debug("model_config: %s", json.dumps(
+            {k: v for k, v in model_config.items() if k != "api_key"}, indent=2
+        ))
+
+        try:
+            runner = RealtimeRunner(_agent)
+            self.session = await runner.run(model_config=model_config)
+            await self.session.enter()
+            log.info("OpenAI Realtime session STARTED ✓  model=%s", model_name)
+        except Exception as exc:
+            log.error("Failed to start OpenAI Realtime session: %s\n%s",
+                      exc, traceback.format_exc())
+            raise
 
         self._tasks.append(asyncio.create_task(self._realtime_event_loop()))
         self._tasks.append(asyncio.create_task(self._buffer_flush_loop()))
+        log.info("Background tasks started (event loop + buffer flush)")
 
     async def _realtime_event_loop(self) -> None:
         assert self.session is not None
+        log.info("OpenAI event loop running")
         try:
             async for event in self.session:
                 await self._handle_realtime_event(event)
         except asyncio.CancelledError:
-            pass
+            log.info("OpenAI event loop cancelled")
         except Exception as exc:
-            print(f"[OpenAI] Event loop error: {exc}")
+            log.error("OpenAI event loop crashed: %s\n%s", exc, traceback.format_exc())
+        log.info("OpenAI event loop exited")
 
     async def _handle_realtime_event(self, event: RealtimeSessionEvent) -> None:
         if event.type == "audio":
+            self._openai_audio_chunks += 1
+            if self._openai_audio_chunks == 1:
+                log.info("First audio chunk from OpenAI — %d bytes", len(event.audio.data))
             frame = build_compact_frame(
                 payload=event.audio.data,
                 bid=self._bid,
@@ -489,7 +523,8 @@ class AvayaHandler:
             await self.ws.send_bytes(frame)
 
         elif event.type == "audio_end":
-            # Signal end of bot utterance with the last-frame flag
+            log.info("OpenAI audio_end — sending last-frame to Avaya  (chunks=%d)",
+                     self._openai_audio_chunks)
             end_frame = build_compact_frame(
                 payload=b"",
                 bid=self._bid,
@@ -501,11 +536,16 @@ class AvayaHandler:
             await self.ws.send_bytes(end_frame)
 
         elif event.type == "audio_interrupted":
-            # Caller interrupted — stop sending bot audio
-            print("[OpenAI] Caller interrupted bot audio")
+            log.info("OpenAI audio_interrupted — caller spoke over bot")
 
         elif event.type == "raw_model_event":
-            pass   # ignore low-level model events
+            raw = getattr(event, "data", None) or getattr(event, "event", None)
+            if raw:
+                etype = raw.get("type", "") if isinstance(raw, dict) else str(raw)[:80]
+                log.debug("raw_model_event: %s", etype)
+
+        else:
+            log.debug("OpenAI event: type=%s", event.type)
 
     # ── Audio buffering ──────────────────────────────────────────
 
@@ -515,10 +555,11 @@ class AvayaHandler:
         data = bytes(self._audio_buf)
         self._audio_buf.clear()
         self._last_flush = time.monotonic()
+        self._audio_bytes_tx += len(data)
         await self.session.send_audio(data)
 
     async def _buffer_flush_loop(self) -> None:
-        """Periodically flush the audio buffer so stale data is not held back."""
+        log.debug("Buffer flush loop started (interval=%.0f ms)", self.CHUNK_LENGTH_S * 1000)
         try:
             while True:
                 await asyncio.sleep(self.CHUNK_LENGTH_S)
@@ -526,9 +567,9 @@ class AvayaHandler:
                 if self._audio_buf and now - self._last_flush > self.CHUNK_LENGTH_S * 2:
                     await self._flush_audio()
         except asyncio.CancelledError:
-            pass
+            log.debug("Buffer flush loop cancelled")
         except Exception as exc:
-            print(f"[Avaya] Buffer flush loop error: {exc}")
+            log.error("Buffer flush loop error: %s", exc)
 
     # ── Utilities ────────────────────────────────────────────────
 
@@ -540,14 +581,14 @@ class AvayaHandler:
         return CODEC_ID_TO_NAME.get(self._codec_id, "PCMU")
 
     def _pick_codec(self, offered: list[str]) -> str:
-        """Select codec from offered list, preferring PCMU (OpenAI-compatible)."""
         for preferred in ("PCMU", "PCMA"):
             if preferred in offered:
                 self._codec_id = CODEC_NAME_MAP[preferred]
                 return preferred
-        # Fallback to first offered codec
         first = offered[0] if offered else "PCMU"
         self._codec_id = CODEC_NAME_MAP.get(first, CODEC_PCMU)
+        log.warning("PCMU/PCMA not in offered codecs %s — using %s (may need conversion)",
+                    offered, first)
         return first
 
     async def _send_json(self, payload: dict) -> None:

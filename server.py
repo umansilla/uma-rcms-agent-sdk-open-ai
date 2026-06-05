@@ -23,6 +23,7 @@ Environment variables (see .env.example):
     JWT_SECRET_KEY          required when ENABLE_AUTH=true
 """
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -44,12 +45,29 @@ else:
     except ImportError:
         from avaya_handler import AvayaHandler
 
+log = logging.getLogger("server")
+
 # ─────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────
 
 ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").lower() == "true"
 JWT_SECRET  = os.getenv("JWT_SECRET_KEY", "")
+
+# ─────────────────────────────────────────────────────────────────
+# Startup log
+# ─────────────────────────────────────────────────────────────────
+
+_model   = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
+_api_key = os.getenv("OPENAI_API_KEY", "")
+
+log.info("═══════════════════════════════════════════")
+log.info("  Avaya RCMS → OpenAI Realtime Bridge")
+log.info("  model     : %s", _model)
+log.info("  api_key   : %s", ("set ✓" if _api_key else "NOT SET ✗"))
+log.info("  auth      : %s", ("enabled" if ENABLE_AUTH else "disabled"))
+log.info("  endpoint  : ws://0.0.0.0:PORT/media-stream")
+log.info("═══════════════════════════════════════════")
 
 # ─────────────────────────────────────────────────────────────────
 # Application
@@ -81,14 +99,15 @@ async def media_stream(websocket: WebSocket):
             await websocket.close(code=4403, reason="Invalid or expired JWT")
             return
 
+    log.info("Incoming WebSocket connection — path=%s", websocket.url.path)
     handler = AvayaHandler(websocket)
     try:
         await handler.start()
         await handler.wait_until_done()
     except WebSocketDisconnect:
-        print("[Server] WebSocket disconnected")
+        log.info("WebSocket disconnected (clean)")
     except Exception as exc:
-        print(f"[Server] Unhandled error: {exc}")
+        log.error("Unhandled error in media_stream: %s", exc, exc_info=True)
     finally:
         await handler.cleanup()
 
