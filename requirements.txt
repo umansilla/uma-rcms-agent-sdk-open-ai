@@ -1,19 +1,20 @@
 # Avaya RCMS → OpenAI Realtime bridge
 # Requires Python 3.11  (see runtime.txt / render.yaml)
+# Versions pinned to avoid pip resolver timeout during Render builds.
 
 # Web framework + ASGI server
-fastapi>=0.115.0,<1.0
-uvicorn[standard]>=0.30.0,<1.0
+fastapi==0.115.12
+uvicorn[standard]==0.48.0
 
-# OpenAI Agents SDK — includes Realtime API support
-# Install with [voice] extra for audio/realtime dependencies
-openai-agents[voice]>=0.0.17
+# OpenAI Agents SDK with Realtime API support
+openai==1.109.1
+openai-agents[voice]==0.8.4
 
 # JWT authentication (for Avaya's signed tokens)
-PyJWT>=2.9.0,<3.0
+PyJWT==2.10.1
 
 # Load .env in local development (no-op on Render)
-python-dotenv>=1.0.0,<2.0
+python-dotenv==1.1.0
 
 # WebSocket transport for uvicorn
-websockets>=13.0,<15.0
+websockets==14.1
