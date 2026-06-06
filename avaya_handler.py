@@ -717,7 +717,7 @@ class AvayaHandler:
             "type": "realtime",
             "model": "gpt-realtime-mini",
             # Bloquea la salida a audio (agrega "text" si también deseas texto)
-            "output_modalities": ["audio", "text"],
+            "output_modalities": ["audio"],
             "audio": {
                 "input": {
                     "format": {
