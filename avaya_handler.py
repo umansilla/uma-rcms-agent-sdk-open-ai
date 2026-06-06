@@ -428,6 +428,8 @@ class AvayaHandler:
 
             if msg_type == "session.start":
                 await self._on_session_start(msg)
+            elif msg_type == "media":
+                await self._on_media(msg)
             elif msg_type == "session.ping":
                 await self._on_session_ping(msg)
             elif msg_type == "session.end":
@@ -590,6 +592,24 @@ class AvayaHandler:
         }
         log.info("→ SEND [%s]", ended_type)
         await self._send_json(resp)
+
+    async def _on_media(self, msg: dict) -> None:
+        # Only forward caller→bot audio (src="tx"); ignore bot→caller echoes (src="rx")
+        if msg.get("src") != "tx":
+            return
+        audio_b64 = msg.get("audio", "")
+        if not audio_b64:
+            return
+        audio_bytes = base64.b64decode(audio_b64)
+        self._audio_bytes_rx += len(audio_bytes)
+        if self._openai_ws is not None:
+            self._audio_buf.extend(audio_bytes)
+            if len(self._audio_buf) >= self.BUFFER_SIZE:
+                await self._flush_audio()
+        else:
+            self._frames_rx += 1
+            if self._frames_rx % self._BINARY_LOG_EVERY == 0:
+                log.debug("media arriving but OpenAI not connected yet (count=%d)", self._frames_rx)
 
     async def _on_session_end(self, msg: dict) -> None:
         log.info("session.end received — closing")
