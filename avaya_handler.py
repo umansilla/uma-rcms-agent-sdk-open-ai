@@ -714,7 +714,8 @@ class AvayaHandler:
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
         instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
         session_cfg = {
-            "modalities": ["audio", "text"],
+            "type": "realtime",
+            "modalities": ["audio"],
             "input_audio_format": audio_fmt,
             "output_audio_format": audio_fmt,
             "turn_detection": {
