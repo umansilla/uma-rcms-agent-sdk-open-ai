@@ -75,9 +75,9 @@ FLAG_OLD_SOURCE_TX  = 0x04
 assert OLD_HEADER_SIZE == 52
 
 # ── Compact format: 16-byte header ───────────────────────────────
-#   B bid(1)  B source(1)  H flags(2)  I seq(4)  Q timestamp_us(8)
+#   H flags(2)  B bid(1)  B source(1)  I seq(4)  Q timestamp_us(8)
 #   Payload = everything after the 16-byte header.
-_CMP_FMT        = ">BBHIQ"
+_CMP_FMT        = ">HBBIQ"
 CMP_HEADER_SIZE = struct.calcsize(_CMP_FMT)   # 16
 FLAG_CMP_LAST_FRAME = 0x0001
 FLAG_CMP_EXTENSION  = 0x0002
@@ -115,7 +115,7 @@ def parse_binary_frame(data: bytes) -> dict[str, Any] | None:
     # Compact 16-byte format
     if len(data) < CMP_HEADER_SIZE:
         return None
-    bid, source, flags, seq, ts_us = struct.unpack_from(_CMP_FMT, data, 0)
+    flags, bid, source, seq, ts_us = struct.unpack_from(_CMP_FMT, data, 0)
     offset = CMP_HEADER_SIZE
     if flags & FLAG_CMP_EXTENSION and len(data) >= offset + 2:
         ext_len = struct.unpack_from(">H", data, offset)[0]
@@ -137,14 +137,174 @@ def parse_binary_frame(data: bytes) -> dict[str, Any] | None:
 def build_compact_frame(
     payload: bytes,
     bid: int = 0,
-    source: int = SOURCE_RX,
+    source: int = SOURCE_NONE,
     seq: int = 0,
+    ts_us: int = 0,
     is_last: bool = False,
 ) -> bytes:
     flags  = FLAG_CMP_LAST_FRAME if is_last else 0
-    ts_us  = int(time.monotonic() * 1_000_000)
-    header = struct.pack(_CMP_FMT, bid, source, flags, seq, ts_us)
+    header = struct.pack(_CMP_FMT, flags, bid, source, seq, ts_us)
     return header + payload
+
+
+# ─────────────────────────────────────────────────────────────────
+# Ingress streamer — chunks and paces bot audio → Avaya
+# Ported from byobot_server.py IngressStreamer (byobot_server.py:751-1264)
+# ─────────────────────────────────────────────────────────────────
+
+class _IngressStreamer:
+    """Accepts raw PCMU blobs from OpenAI, chunks them to 100 ms slices,
+    and paces them to the Avaya WebSocket at real-time rate."""
+
+    CHUNK_MS   = 100
+    SAMPLE_RATE = 8_000
+    CHUNK_SIZE  = (SAMPLE_RATE * CHUNK_MS) // 1000   # 800 bytes @ 8 kHz PCMU
+    CHUNK_US   = CHUNK_MS * 1_000                    # 100 000 µs per chunk
+
+    def __init__(self, ws: WebSocket, bid: int) -> None:
+        self._ws       = ws
+        self._bid      = bid
+        self._buf:  bytearray = bytearray()
+        self._seq:  int = 0
+        self._ts_us: int = 0           # set to epoch µs on first send
+        self._is_last_pending = False  # mark final chunk when audio_end arrives
+        self._queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._task:  asyncio.Task | None = None
+        self._frames_tx = 0
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._streaming_loop())
+
+    async def queue_audio(self, data: bytes) -> None:
+        await self._queue.put(data)
+        self.start()
+
+    async def mark_last(self) -> None:
+        """Signal that the current audio response has ended."""
+        await self._queue.put(None)   # sentinel
+
+    async def barge_in(self) -> None:
+        """Cancel current playback and send a zero-payload LAST frame."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        # drain queue
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._buf.clear()
+        # single empty LAST frame to tell Avaya to stop
+        ts = self._ts_us if self._ts_us else int(time.time() * 1_000_000)
+        frame = build_compact_frame(
+            payload=b"",
+            bid=self._bid,
+            source=SOURCE_NONE,
+            seq=self._seq,
+            ts_us=ts,
+            is_last=True,
+        )
+        self._seq += 1
+        await self._ws.send_bytes(frame)
+        log.info("← barge-in: sent empty LAST frame  bid=%d seq=%d", self._bid, self._seq - 1)
+        self._task = None
+
+    async def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _streaming_loop(self) -> None:
+        pacing_start: float | None = None
+        chunks_sent = 0
+
+        try:
+            while True:
+                # Fill buffer from queue until we have at least one chunk
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    # Flush any trailing partial chunk on idle timeout
+                    if self._buf:
+                        await self._send_chunk(bytes(self._buf), is_last=True,
+                                               chunks_sent=chunks_sent)
+                    break
+
+                if item is None:
+                    # End-of-response sentinel: flush remaining buffer as LAST
+                    if self._buf:
+                        await self._send_chunk(bytes(self._buf), is_last=True,
+                                               chunks_sent=chunks_sent)
+                        chunks_sent += 1
+                    else:
+                        # Empty buf: send zero-payload LAST frame
+                        ts = self._ts_us if self._ts_us else int(time.time() * 1_000_000)
+                        frame = build_compact_frame(
+                            payload=b"", bid=self._bid, source=SOURCE_NONE,
+                            seq=self._seq, ts_us=ts, is_last=True,
+                        )
+                        self._seq += 1
+                        await self._ws.send_bytes(frame)
+                    self._buf.clear()
+                    pacing_start = None
+                    chunks_sent = 0
+                    continue
+
+                self._buf.extend(item)
+
+                # Drain full chunks from buffer
+                while len(self._buf) >= self.CHUNK_SIZE:
+                    chunk = bytes(self._buf[:self.CHUNK_SIZE])
+                    del self._buf[:self.CHUNK_SIZE]
+
+                    if pacing_start is None:
+                        pacing_start = time.monotonic()
+                        self._ts_us = int(time.time() * 1_000_000)
+
+                    await self._send_chunk(chunk, is_last=False,
+                                           chunks_sent=chunks_sent)
+                    chunks_sent += 1
+
+                    # Pace: sleep until the next chunk boundary
+                    target = pacing_start + chunks_sent * (self.CHUNK_MS / 1000.0)
+                    sleep_s = target - time.monotonic()
+                    if sleep_s > 0:
+                        await asyncio.sleep(sleep_s)
+                    elif sleep_s < -(self.CHUNK_MS / 1000.0):
+                        log.warning("Ingress pacing falling behind by %.1f ms", -sleep_s * 1000)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.error("_IngressStreamer loop crashed: %s", exc)
+
+    async def _send_chunk(self, chunk: bytes, is_last: bool, chunks_sent: int) -> None:
+        ts = self._ts_us + chunks_sent * self.CHUNK_US
+        frame = build_compact_frame(
+            payload=chunk,
+            bid=self._bid,
+            source=SOURCE_NONE,
+            seq=self._seq,
+            ts_us=ts,
+            is_last=is_last,
+        )
+        self._seq += 1
+        self._frames_tx += 1
+        await self._ws.send_bytes(frame)
+        if self._frames_tx == 1:
+            log.info("→ first send  bid=%d source=0 seq=%d ts_us=%d payload=%d B",
+                     self._bid, self._seq - 1, ts, len(chunk))
+        elif self._frames_tx % 50 == 0:
+            log.debug("→ frames_tx=%d bid=%d seq=%d payload=%d B last=%s",
+                      self._frames_tx, self._bid, self._seq - 1, len(chunk), is_last)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -196,14 +356,18 @@ class AvayaHandler:
 
         self._session_id:  str = ""
         self._endpoint_id: str = ""
-        self._bid:         int = 0
         self._codec_id:    int = CODEC_PCMU
 
-        self._seq_out:  int = 0
+        # ingress_bid per endpoint — assigned during session.start (monotonic counter
+        # shared with egress bids, matching byobot_server.py:1790-1853)
+        self._ingress_bid_by_endpoint: dict[str, int] = {}
+
         self._json_seq: int = 0
 
         self._audio_buf:  bytearray = bytearray()
         self._last_flush: float     = time.monotonic()
+
+        self._streamer: _IngressStreamer | None = None
 
         # Stats
         self._frames_rx:    int = 0   # binary frames received
@@ -248,10 +412,13 @@ class AvayaHandler:
             log.error("Receive loop crashed: %s\n%s", exc, traceback.format_exc())
 
     async def cleanup(self) -> None:
+        if self._streamer:
+            await self._streamer.stop()
         log.info(
-            "Cleanup — frames_rx=%d  audio_rx=%d B  audio_tx=%d B  openai_chunks=%d",
+            "Cleanup — frames_rx=%d  audio_rx=%d B  audio_tx=%d B  openai_chunks=%d  frames_tx=%d",
             self._frames_rx, self._audio_bytes_rx,
             self._audio_bytes_tx, self._openai_audio_chunks,
+            self._streamer._frames_tx if self._streamer else 0,
         )
         for task in self._tasks:
             task.cancel()
@@ -288,45 +455,76 @@ class AvayaHandler:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
         log.info("session.start — sessionId=%s", self._session_id)
 
-        resp_endpoints = []
+        # ── Pick transport encoding and codec from mediaTransports ──
+        transports = msg.get("mediaTransports", [])
+        selected_transport_type = "avaya-wss"
+        selected_encoding       = "binary"
+        selected_codec_entry    = ["audio", "PCMU", 8000, 1]
+
+        if transports:
+            t = transports[0]
+            selected_transport_type = t.get("type", "avaya-wss")
+            encodings = t.get("transportEncodings", ["binary"])
+            selected_encoding = "binary" if "binary" in encodings else encodings[0]
+            codecs = t.get("mediaCodecs", [["audio", "PCMU", 8000, 1]])
+            self._pick_codec([c[1] if isinstance(c, list) else c for c in codecs])
+            for c in codecs:
+                name = c[1] if isinstance(c, list) else c
+                if name in ("PCMU", "PCMA"):
+                    selected_codec_entry = c if isinstance(c, list) else ["audio", name, 8000, 1]
+                    break
+            else:
+                selected_codec_entry = codecs[0] if codecs else selected_codec_entry
+
+        log.info(
+            "  transport=%s  encoding=%s  codec=%s",
+            selected_transport_type, selected_encoding, self._codec_name(),
+        )
+
+        # ── Assign bid counters for each endpoint (mirrors byobot_server.py:1790-1853) ──
+        bid_counter = 0
         for i, ep in enumerate(msg.get("mediaEndpoints", [])):
-            ep_id = ep.get("id", str(uuid.uuid4()))
+            ep_id   = ep.get("endpointId", ep.get("id", str(uuid.uuid4())))
+            flows   = ep.get("flows", {})
+            audio   = flows.get("audio", {})
+            egress  = audio.get("egress", {})
+            ingress = audio.get("ingress", {})
+
             if not self._endpoint_id:
                 self._endpoint_id = ep_id
 
-            flows      = ep.get("flows", {})
-            audio_flow = flows.get("audio", {})
-            egress     = audio_flow.get("egress", {})
-            offered    = egress.get("codecs", ["PCMU"])
-            chosen     = self._pick_codec(offered)
+            sources = [s for s in egress.get("sources", []) if s.lower() != "none"]
+            if sources:
+                egress_bid = bid_counter
+                bid_counter += 1
+                log.info("  endpoint[%d] id=%s  egress_bid=%d  sources=%s",
+                         i, ep_id, egress_bid, sources)
 
-            log.info(
-                "  endpoint[%d] id=%s  transport=%s  offered_codecs=%s  chosen=%s",
-                i, ep_id, ep.get("transport"), offered, chosen,
-            )
+            ingress_target = ingress.get("target", [])
+            if ingress_target and ingress_target != ["none"]:
+                ingress_bid = bid_counter
+                bid_counter += 1
+                self._ingress_bid_by_endpoint[ep_id] = ingress_bid
+                log.info("  endpoint[%d] id=%s  ingress_bid=%d", i, ep_id, ingress_bid)
 
-            resp_endpoints.append({
-                "id":        ep_id,
-                "transport": ep.get("transport", "binary"),
-                "flows": {
-                    "audio": {
-                        "egress":  {"codec": chosen, "sampleRate": 8000},
-                        "ingress": {"codec": chosen, "sampleRate": 8000},
-                    }
-                },
-            })
+        log.info("  ingress_bids=%s", self._ingress_bid_by_endpoint)
 
+        # ── Reply echoing chosen encoding + codec only; no mediaEndpoints ──
         resp: dict[str, Any] = {
             "version":     msg.get("version", "1.0.0"),
             "type":        "session.started",
             "sessionId":   self._session_id,
             "sequenceNum": self._next_json_seq(),
             "timestamp":   _iso_now(),
+            "mediaTransports": [{
+                "type":             selected_transport_type,
+                "transportEncoding": selected_encoding,
+                "mediaCodecs":      [selected_codec_entry],
+            }],
         }
-        if resp_endpoints:
-            resp["mediaEndpoints"] = resp_endpoints
 
-        log.info("→ SEND [session.started]  codec=%s", self._codec_name())
+        log.info("→ SEND [session.started]  codec=%s  encoding=%s",
+                 self._codec_name(), selected_encoding)
         log.debug("Full response:\n%s", json.dumps(resp, indent=2))
         await self._send_json(resp)
 
@@ -431,9 +629,6 @@ class AvayaHandler:
         if not frame["is_tx"]:
             return   # Skip frames we sent (RX / echoed back)
 
-        if frame.get("bid") is not None:
-            self._bid = frame["bid"]
-
         payload = frame.get("payload", b"")
         if not payload:
             return
@@ -491,6 +686,18 @@ class AvayaHandler:
                       exc, traceback.format_exc())
             raise
 
+        # Build streamer using the ingress bid for this endpoint
+        bid = self._ingress_bid_by_endpoint.get(self._endpoint_id)
+        if bid is None:
+            log.warning(
+                "No ingress bid found for endpoint=%s — defaulting to bid=1. "
+                "Check that session.start carries mediaEndpoints with ingress targets.",
+                self._endpoint_id,
+            )
+            bid = 1
+        self._streamer = _IngressStreamer(ws=self.ws, bid=bid)
+        log.info("_IngressStreamer created  bid=%d  endpoint=%s", bid, self._endpoint_id)
+
         self._tasks.append(asyncio.create_task(self._realtime_event_loop()))
         self._tasks.append(asyncio.create_task(self._buffer_flush_loop()))
         log.info("Background tasks started (event loop + buffer flush)")
@@ -512,31 +719,19 @@ class AvayaHandler:
             self._openai_audio_chunks += 1
             if self._openai_audio_chunks == 1:
                 log.info("First audio chunk from OpenAI — %d bytes", len(event.audio.data))
-            frame = build_compact_frame(
-                payload=event.audio.data,
-                bid=self._bid,
-                source=SOURCE_RX,
-                seq=self._seq_out,
-                is_last=False,
-            )
-            self._seq_out += 1
-            await self.ws.send_bytes(frame)
+            if self._streamer:
+                await self._streamer.queue_audio(event.audio.data)
 
         elif event.type == "audio_end":
-            log.info("OpenAI audio_end — sending last-frame to Avaya  (chunks=%d)",
+            log.info("OpenAI audio_end — flushing last chunk to Avaya  (chunks=%d)",
                      self._openai_audio_chunks)
-            end_frame = build_compact_frame(
-                payload=b"",
-                bid=self._bid,
-                source=SOURCE_RX,
-                seq=self._seq_out,
-                is_last=True,
-            )
-            self._seq_out += 1
-            await self.ws.send_bytes(end_frame)
+            if self._streamer:
+                await self._streamer.mark_last()
 
         elif event.type == "audio_interrupted":
             log.info("OpenAI audio_interrupted — caller spoke over bot")
+            if self._streamer:
+                await self._streamer.barge_in()
 
         elif event.type == "raw_model_event":
             raw = getattr(event, "data", None) or getattr(event, "event", None)
