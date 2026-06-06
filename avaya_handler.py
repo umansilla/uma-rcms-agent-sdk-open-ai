@@ -149,7 +149,7 @@ class _IngressStreamer:
     """Accepts raw PCMU blobs from OpenAI, chunks them to 20 ms slices,
     and paces them to the Avaya WebSocket at real-time rate."""
 
-    CHUNK_MS   = 20
+    CHUNK_MS   = 100
     SAMPLE_RATE = 8_000
     CHUNK_SIZE  = (SAMPLE_RATE * CHUNK_MS) // 1000   # 160 bytes @ 8 kHz PCMU
     CHUNK_US   = CHUNK_MS * 1_000                    # 20 000 µs per chunk
