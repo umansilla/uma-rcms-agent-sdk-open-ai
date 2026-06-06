@@ -713,6 +713,7 @@ class AvayaHandler:
         # g711_ulaw = PCMU (8 kHz, µ-law), g711_alaw = PCMA
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
         session_cfg = {
+            "type": "realtime",
             "modalities": ["audio", "text"],
             "instructions": "Be extra nice today!",
             "input_audio_format": audio_fmt,
