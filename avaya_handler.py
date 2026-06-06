@@ -715,16 +715,26 @@ class AvayaHandler:
         instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
         session_cfg = {
             "type": "realtime",
-            "modalities": ["audio"],
-            "input_audio_format": audio_fmt,
-            "output_audio_format": audio_fmt,
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500,
-            },
-            "instructions": instructions,
+            "model": "gpt-realtime-mini",
+            # Bloquea la salida a audio (agrega "text" si también deseas texto)
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": {
+                        "type": "audio/pcm",
+                        "rate": 24000,
+                    },
+                    "turn_detection": {
+                        "type": "semantic_vad"
+                    }
+                },
+                "output": {
+                    "format": {
+                        "type": "audio/pcmu",
+                    },
+                    "voice": "marin",
+                }
+            }
         }
         log.info(
             "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=server_vad",
