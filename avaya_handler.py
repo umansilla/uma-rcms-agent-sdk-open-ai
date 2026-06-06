@@ -717,15 +717,14 @@ class AvayaHandler:
             "type": "realtime",
             "model": "gpt-realtime-mini",
             # Bloquea la salida a audio (agrega "text" si también deseas texto)
-            "output_modalities": ["audio"],
+            "output_modalities": ["audio", "text"],
             "audio": {
                 "input": {
                     "format": {
-                        "type": "audio/pcm",
-                        "rate": 24000,
+                        "type": "audio/pcmu"
                     },
                     "turn_detection": {
-                        "type": "semantic_vad"
+                        "type": "server_vad"
                     }
                 },
                 "output": {
