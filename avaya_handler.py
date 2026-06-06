@@ -146,13 +146,13 @@ def build_compact_frame(
 # ─────────────────────────────────────────────────────────────────
 
 class _IngressStreamer:
-    """Accepts raw PCMU blobs from OpenAI, chunks them to 100 ms slices,
+    """Accepts raw PCMU blobs from OpenAI, chunks them to 20 ms slices,
     and paces them to the Avaya WebSocket at real-time rate."""
 
-    CHUNK_MS   = 100
+    CHUNK_MS   = 20
     SAMPLE_RATE = 8_000
-    CHUNK_SIZE  = (SAMPLE_RATE * CHUNK_MS) // 1000   # 800 bytes @ 8 kHz PCMU
-    CHUNK_US   = CHUNK_MS * 1_000                    # 100 000 µs per chunk
+    CHUNK_SIZE  = (SAMPLE_RATE * CHUNK_MS) // 1000   # 160 bytes @ 8 kHz PCMU
+    CHUNK_US   = CHUNK_MS * 1_000                    # 20 000 µs per chunk
 
     def __init__(self, ws: WebSocket, bid: int) -> None:
         self._ws       = ws
@@ -508,18 +508,23 @@ class AvayaHandler:
 
         log.info("  ingress_bids=%s", self._ingress_bid_by_endpoint)
 
-        # ── Reply echoing chosen encoding + codec only; no mediaEndpoints ──
+        # ── Reply with schema-compliant session.started (RCMS spec §session.started) ──
         resp: dict[str, Any] = {
             "version":     msg.get("version", "1.0.0"),
             "type":        "session.started",
             "sessionId":   self._session_id,
             "sequenceNum": self._next_json_seq(),
             "timestamp":   _iso_now(),
-            "mediaTransports": [{
-                "type":             selected_transport_type,
-                "transportEncoding": selected_encoding,
-                "mediaCodecs":      [selected_codec_entry],
-            }],
+            "payload": {
+                "services": list(payload_body.get("services", [])),
+                "mediaTransport": {
+                    "type":              selected_transport_type,
+                    "preferredPTimeMs":  _IngressStreamer.CHUNK_MS,
+                    "dtx":               "auto",
+                    "mediaCodecs":       [selected_codec_entry],
+                    "transportEncoding": selected_encoding,
+                },
+            },
         }
 
         log.info("→ SEND [session.started]  codec=%s  encoding=%s",
@@ -693,7 +698,7 @@ class AvayaHandler:
         url = f"wss://api.openai.com/v1/realtime?model={model_name}"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "OpenAI-Safety-Identifier": "hashed-user-id"
+             "OpenAI-Safety-Identifier": "hashed-user-id"
         }
 
         log.info("Conectando a OpenAI Realtime — url=%s  model=%s", url, model_name)
@@ -720,10 +725,9 @@ class AvayaHandler:
             },
         }
         log.info(
-            "→ SEND [session.update]  input_format=%s  output_format=%s  vad=server_vad",
-            audio_fmt, audio_fmt,
+            "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=server_vad  payload=%s",
+            model_name, audio_fmt, audio_fmt, json.dumps(session_cfg),
         )
-        log.debug("session.update payload:\n%s", json.dumps(session_cfg, indent=2))
         await self._openai_send({"type": "session.update", "session": session_cfg})
 
         # Build streamer using the ingress bid for this endpoint
@@ -834,7 +838,12 @@ class AvayaHandler:
                     log.info("OpenAI transcript: %s", event.get("transcript", ""))
 
                 elif etype == "error":
-                    log.error("OpenAI API error: %s", json.dumps(event, indent=2))
+                    err = event.get("error", event)
+                    log.error(
+                        "OpenAI API error — type=%s code=%s message=%s param=%s",
+                        err.get("type"), err.get("code"),
+                        err.get("message"), err.get("param"),
+                    )
 
                 else:
                     log.info("OpenAI event (no manejado): %s  full=%s",
