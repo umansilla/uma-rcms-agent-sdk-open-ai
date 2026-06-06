@@ -714,16 +714,7 @@ class AvayaHandler:
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
         session_cfg = {
             "type": "realtime",
-            "modalities": ["audio", "text"],
-            "instructions": "Be extra nice today!",
-            "input_audio_format": audio_fmt,
-            "output_audio_format": audio_fmt,
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500,
-            },
+            "instructions": "Be extra nice today!"
         }
         log.info(
             "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=server_vad  payload=%s",
