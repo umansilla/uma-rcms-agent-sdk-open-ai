@@ -12,6 +12,7 @@ Avaya RCMS protocol references:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -22,16 +23,8 @@ import uuid
 from datetime import datetime, UTC
 from typing import Any
 
+import websockets
 from fastapi import WebSocket
-
-from agents import function_tool
-from agents.realtime import (
-    RealtimeAgent,
-    RealtimePlaybackTracker,
-    RealtimeRunner,
-    RealtimeSession,
-    RealtimeSessionEvent,
-)
 
 # ─────────────────────────────────────────────────────────────────
 # Logger
@@ -307,33 +300,6 @@ class _IngressStreamer:
                       self._frames_tx, self._bid, self._seq - 1, len(chunk), is_last)
 
 
-# ─────────────────────────────────────────────────────────────────
-# OpenAI Realtime agent
-# ─────────────────────────────────────────────────────────────────
-
-@function_tool
-def get_weather(city: str) -> str:
-    """Get the current weather in a city."""
-    return f"The weather in {city} is sunny with mild temperatures."
-
-
-@function_tool
-def get_current_time() -> str:
-    """Get the current time."""
-    return f"The current time is {datetime.now().strftime('%H:%M:%S')}."
-
-
-_agent = RealtimeAgent(
-    name="Avaya Voice Assistant",
-    instructions=(
-        "You are a helpful voice assistant on a phone call. "
-        "Keep your responses concise and conversational — this is a phone call, "
-        "so avoid long lists or complex formatting. "
-        "Start every new conversation with a brief, friendly greeting."
-    ),
-    tools=[get_weather, get_current_time],
-)
-
 
 # ─────────────────────────────────────────────────────────────────
 # Main handler
@@ -351,8 +317,7 @@ class AvayaHandler:
 
     def __init__(self, websocket: WebSocket) -> None:
         self.ws              = websocket
-        self.session: RealtimeSession | None = None
-        self.playback_tracker                = RealtimePlaybackTracker()
+        self._openai_ws: websockets.ClientConnection | None = None
 
         self._session_id:  str = ""
         self._endpoint_id: str = ""
@@ -414,6 +379,11 @@ class AvayaHandler:
     async def cleanup(self) -> None:
         if self._streamer:
             await self._streamer.stop()
+        if self._openai_ws is not None:
+            try:
+                await self._openai_ws.close()
+            except Exception:
+                pass
         log.info(
             "Cleanup — frames_rx=%d  audio_rx=%d B  audio_tx=%d B  openai_chunks=%d  frames_tx=%d",
             self._frames_rx, self._audio_bytes_rx,
@@ -579,7 +549,7 @@ class AvayaHandler:
         log.info("Service start — type=%s  service=%s  endpoint=%s",
                  msg_type, service, endpoint_id)
 
-        if self.session is None:
+        if self._openai_ws is None:
             log.info("No OpenAI session yet — initializing now")
             await self._start_openai_session()
         else:
@@ -673,7 +643,7 @@ class AvayaHandler:
 
         self._audio_bytes_rx += len(payload)
 
-        if self.session is not None:
+        if self._openai_ws is not None:
             self._audio_buf.extend(payload)
             if len(self._audio_buf) >= self.BUFFER_SIZE:
                 await self._flush_audio()
@@ -688,43 +658,34 @@ class AvayaHandler:
     # ── OpenAI Realtime session ──────────────────────────────────
 
     async def _start_openai_session(self) -> None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+
+        model_name = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
+        url = f"wss://api.openai.com/v1/realtime?model={model_name}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "OpenAI-Safety-Identifier": "hashed-user-id",
+        }
+
+        log.info("Conectando a OpenAI Realtime — url=%s", url)
         try:
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
-                raise ValueError("OPENAI_API_KEY environment variable is required")
-
-            model_name = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
-            log.info("Starting OpenAI Realtime session — model=%s", model_name)
-
-            model_config = {
-                "api_key": api_key,
-                "initial_model_settings": {
-                    "model_name":          model_name,
-                    "input_audio_format":  "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "turn_detection": {
-                        "type":               "semantic_vad",
-                        "interrupt_response": True,
-                        "create_response":    True,
-                    },
-                },
-                "playback_tracker": self.playback_tracker,
-            }
-            log.debug("model_config: %s", json.dumps(
-                {k: v for k, v in model_config.items()
-                 if k not in ("api_key", "playback_tracker")}, indent=2
-            ))
-
-        
-            runner = RealtimeRunner(_agent)
-            self.session = await runner.run(model_config=model_config)
-            await self.session.enter()
-            log.info("OpenAI Realtime session STARTED ✓  model=%s", model_name)
+            self._openai_ws = await websockets.connect(url, additional_headers=headers)
         except Exception as exc:
-            log.error("Failed to start OpenAI Realtime session: %s\n%s",
+            log.error("Failed to connect to OpenAI Realtime WebSocket: %s\n%s",
                       exc, traceback.format_exc())
             raise
+        log.info("WebSocket OpenAI ABIERTO ✓  model=%s", model_name)
+
+        await self._openai_send({
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "instructions": "Be extra nice today!",
+            },
+        })
 
         # Build streamer using the ingress bid for this endpoint
         bid = self._ingress_bid_by_endpoint.get(self._endpoint_id)
@@ -738,88 +699,78 @@ class AvayaHandler:
         self._streamer = _IngressStreamer(ws=self.ws, bid=bid)
         log.info("_IngressStreamer created  bid=%d  endpoint=%s", bid, self._endpoint_id)
 
-        self._tasks.append(asyncio.create_task(self._realtime_event_loop()))
+        self._tasks.append(asyncio.create_task(self._openai_event_loop()))
         self._tasks.append(asyncio.create_task(self._buffer_flush_loop()))
         log.info("Background tasks started (event loop + buffer flush)")
 
-    async def _realtime_event_loop(self) -> None:
-        assert self.session is not None
-        log.info("OpenAI event loop running — session=%s", type(self.session).__name__)
+    async def _openai_event_loop(self) -> None:
+        log.info("OpenAI event loop iniciado")
         events_seen = 0
         try:
-            log.info("OpenAI — entering async-for on session iterator")
-            async for event in self.session:
+            async for raw_msg in self._openai_ws:
                 events_seen += 1
-                log.info(
-                    "OpenAI event #%d — type=%s attrs=%s",
-                    events_seen,
-                    getattr(event, "type", "<no-type>"),
-                    [a for a in dir(event) if not a.startswith("_")],
-                )
                 try:
-                    await self._handle_realtime_event(event)
-                except Exception as handler_exc:
-                    log.error(
-                        "Error handling OpenAI event #%d (type=%s): %s\n%s",
-                        events_seen,
-                        getattr(event, "type", "?"),
-                        handler_exc,
-                        traceback.format_exc(),
-                    )
-        except asyncio.CancelledError:
-            log.info("OpenAI event loop cancelled after %d events", events_seen)
-        except Exception as exc:
-            log.error(
-                "OpenAI event loop crashed after %d events: %s\n%s",
-                events_seen, exc, traceback.format_exc(),
-            )
-        log.info("OpenAI event loop exited — total events seen: %d", events_seen)
+                    event = json.loads(raw_msg)
+                except json.JSONDecodeError as exc:
+                    log.error("OpenAI bad JSON #%d: %s", events_seen, exc)
+                    continue
+                etype = event.get("type", "")
+                log.debug("OpenAI event #%d: %s", events_seen, etype)
 
-    async def _handle_realtime_event(self, event: RealtimeSessionEvent) -> None:
-        if event.type == "audio":
-            self._openai_audio_chunks += 1
-            if self._openai_audio_chunks == 1:
-                log.info("First audio chunk from OpenAI — %d bytes", len(event.audio.data))
-            if self._streamer:
-                await self._streamer.queue_audio(event.audio.data)
+                if etype == "session.created":
+                    log.info("OpenAI session.created ✓  id=%s",
+                             event.get("session", {}).get("id"))
 
-        elif event.type == "audio_end":
-            log.info("OpenAI audio_end — flushing last chunk to Avaya  (chunks=%d)",
-                     self._openai_audio_chunks)
-            if self._streamer:
-                await self._streamer.mark_last()
+                elif etype == "session.updated":
+                    log.info("OpenAI session.updated")
 
-        elif event.type == "audio_interrupted":
-            log.info("OpenAI audio_interrupted — caller spoke over bot")
-            if self._streamer:
-                await self._streamer.barge_in()
+                elif etype == "response.output_audio.delta":
+                    audio_bytes = base64.b64decode(event.get("delta", ""))
+                    self._openai_audio_chunks += 1
+                    if self._openai_audio_chunks == 1:
+                        log.info("Primer audio de OpenAI — %d bytes", len(audio_bytes))
+                    if self._streamer:
+                        await self._streamer.queue_audio(audio_bytes)
 
-        elif event.type == "raw_model_event":
-            # Log at INFO so wire-level OpenAI events are visible during debugging
-            raw = getattr(event, "data", None) or getattr(event, "event", None)
-            if isinstance(raw, dict):
-                etype = raw.get("type", "<no-type>")
-                log.info("raw_model_event: type=%s", etype)
-                if etype == "error":
-                    log.error("OpenAI API error in raw_model_event: %s", raw)
+                elif etype == "response.output_audio.done":
+                    log.info("OpenAI audio_done (chunks=%d)", self._openai_audio_chunks)
+                    if self._streamer:
+                        await self._streamer.mark_last()
+
+                elif etype == "input_audio_buffer.speech_started":
+                    log.info("OpenAI: usuario habló — barge-in")
+                    if self._streamer:
+                        await self._streamer.barge_in()
+
+                elif etype == "error":
+                    log.error("OpenAI API error: %s", event)
+
                 else:
-                    log.debug("raw_model_event full: %s", json.dumps(raw, default=str)[:500])
-            else:
-                log.info("raw_model_event (non-dict): %s", str(raw)[:200])
+                    log.debug("OpenAI event (no manejado): %s", etype)
 
-        else:
-            log.info("OpenAI event (unhandled): type=%s", event.type)
+        except asyncio.CancelledError:
+            log.info("OpenAI event loop cancelado (%d eventos)", events_seen)
+        except Exception as exc:
+            log.error("OpenAI event loop crash: %s\n%s", exc, traceback.format_exc())
+        log.info("OpenAI event loop salió — total eventos: %d", events_seen)
 
     # ── Audio buffering ──────────────────────────────────────────
 
     async def _flush_audio(self) -> None:
-        if not self._audio_buf or self.session is None:
+        if not self._audio_buf or self._openai_ws is None:
             return
         data = bytes(self._audio_buf)
         self._audio_buf.clear()
         self._last_flush = time.monotonic()
         self._audio_bytes_tx += len(data)
-        await self.session.send_audio(data)
+        b64 = base64.b64encode(data).decode()
+        await self._openai_send({"type": "input_audio_buffer.append", "audio": b64})
+
+    async def _openai_send(self, msg: dict) -> None:
+        if self._openai_ws is None:
+            log.warning("_openai_send: WebSocket no abierto")
+            return
+        await self._openai_ws.send(json.dumps(msg))
 
     async def _buffer_flush_loop(self) -> None:
         log.debug("Buffer flush loop started (interval=%.0f ms)", self.CHUNK_LENGTH_S * 1000)
