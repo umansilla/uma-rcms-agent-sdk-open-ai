@@ -454,7 +454,7 @@ class AvayaHandler:
 
             msg_type = msg.get("type", "<no-type>")
             log.info("← RECV [%s]", msg_type)
-            log.debug("Full message:\n%s", json.dumps(msg, indent=2))
+            #log.debug("Full message:\n%s", json.dumps(msg, indent=2))
 
             if msg_type == "session.start":
                 await self._on_session_start(msg)
@@ -744,15 +744,36 @@ class AvayaHandler:
 
     async def _realtime_event_loop(self) -> None:
         assert self.session is not None
-        log.info("OpenAI event loop running")
+        log.info("OpenAI event loop running — session=%s", type(self.session).__name__)
+        events_seen = 0
         try:
+            log.info("OpenAI — entering async-for on session iterator")
             async for event in self.session:
-                await self._handle_realtime_event(event)
+                events_seen += 1
+                log.info(
+                    "OpenAI event #%d — type=%s attrs=%s",
+                    events_seen,
+                    getattr(event, "type", "<no-type>"),
+                    [a for a in dir(event) if not a.startswith("_")],
+                )
+                try:
+                    await self._handle_realtime_event(event)
+                except Exception as handler_exc:
+                    log.error(
+                        "Error handling OpenAI event #%d (type=%s): %s\n%s",
+                        events_seen,
+                        getattr(event, "type", "?"),
+                        handler_exc,
+                        traceback.format_exc(),
+                    )
         except asyncio.CancelledError:
-            log.info("OpenAI event loop cancelled")
+            log.info("OpenAI event loop cancelled after %d events", events_seen)
         except Exception as exc:
-            log.error("OpenAI event loop crashed: %s\n%s", exc, traceback.format_exc())
-        log.info("OpenAI event loop exited")
+            log.error(
+                "OpenAI event loop crashed after %d events: %s\n%s",
+                events_seen, exc, traceback.format_exc(),
+            )
+        log.info("OpenAI event loop exited — total events seen: %d", events_seen)
 
     async def _handle_realtime_event(self, event: RealtimeSessionEvent) -> None:
         if event.type == "audio":
@@ -774,13 +795,20 @@ class AvayaHandler:
                 await self._streamer.barge_in()
 
         elif event.type == "raw_model_event":
+            # Log at INFO so wire-level OpenAI events are visible during debugging
             raw = getattr(event, "data", None) or getattr(event, "event", None)
-            if raw:
-                etype = raw.get("type", "") if isinstance(raw, dict) else str(raw)[:80]
-                log.debug("raw_model_event: %s", etype)
+            if isinstance(raw, dict):
+                etype = raw.get("type", "<no-type>")
+                log.info("raw_model_event: type=%s", etype)
+                if etype == "error":
+                    log.error("OpenAI API error in raw_model_event: %s", raw)
+                else:
+                    log.debug("raw_model_event full: %s", json.dumps(raw, default=str)[:500])
+            else:
+                log.info("raw_model_event (non-dict): %s", str(raw)[:200])
 
         else:
-            log.debug("OpenAI event: type=%s", event.type)
+            log.info("OpenAI event (unhandled): type=%s", event.type)
 
     # ── Audio buffering ──────────────────────────────────────────
 
