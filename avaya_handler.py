@@ -595,21 +595,27 @@ class AvayaHandler:
 
     async def _on_media(self, msg: dict) -> None:
         # Only forward caller→bot audio (src="tx"); ignore bot→caller echoes (src="rx")
-        if msg.get("src") != "tx":
+        src = msg.get("src", "")
+        if src != "tx":
             return
         audio_b64 = msg.get("audio", "")
         if not audio_b64:
             return
         audio_bytes = base64.b64decode(audio_b64)
         self._audio_bytes_rx += len(audio_bytes)
+        self._frames_rx += 1
+        if self._frames_rx == 1:
+            log.info("Primera media TX recibida — %d bytes b64-decoded", len(audio_bytes))
         if self._openai_ws is not None:
             self._audio_buf.extend(audio_bytes)
             if len(self._audio_buf) >= self.BUFFER_SIZE:
                 await self._flush_audio()
         else:
-            self._frames_rx += 1
             if self._frames_rx % self._BINARY_LOG_EVERY == 0:
-                log.debug("media arriving but OpenAI not connected yet (count=%d)", self._frames_rx)
+                log.warning(
+                    "media TX llegando pero OpenAI no conectado aún (count=%d, bytes_rx=%d)",
+                    self._frames_rx, self._audio_bytes_rx,
+                )
 
     async def _on_session_end(self, msg: dict) -> None:
         log.info("session.end received — closing")
@@ -687,10 +693,10 @@ class AvayaHandler:
         url = f"wss://api.openai.com/v1/realtime?model={model_name}"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "OpenAI-Safety-Identifier": "hashed-user-id",
+            "OpenAI-Safety-Identifier": "hashed-user-id"
         }
 
-        log.info("Conectando a OpenAI Realtime — url=%s", url)
+        log.info("Conectando a OpenAI Realtime — url=%s  model=%s", url, model_name)
         try:
             self._openai_ws = await websockets.connect(url, additional_headers=headers)
         except Exception as exc:
@@ -699,13 +705,26 @@ class AvayaHandler:
             raise
         log.info("WebSocket OpenAI ABIERTO ✓  model=%s", model_name)
 
-        await self._openai_send({
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "instructions": "Be extra nice today!",
+        # g711_ulaw = PCMU (8 kHz, µ-law), g711_alaw = PCMA
+        audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
+        session_cfg = {
+            "modalities": ["audio", "text"],
+            "instructions": "Be extra nice today!",
+            "input_audio_format": audio_fmt,
+            "output_audio_format": audio_fmt,
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500,
             },
-        })
+        }
+        log.info(
+            "→ SEND [session.update]  input_format=%s  output_format=%s  vad=server_vad",
+            audio_fmt, audio_fmt,
+        )
+        log.debug("session.update payload:\n%s", json.dumps(session_cfg, indent=2))
+        await self._openai_send({"type": "session.update", "session": session_cfg})
 
         # Build streamer using the ingress bid for this endpoint
         bid = self._ingress_bid_by_endpoint.get(self._endpoint_id)
@@ -734,39 +753,92 @@ class AvayaHandler:
                 except json.JSONDecodeError as exc:
                     log.error("OpenAI bad JSON #%d: %s", events_seen, exc)
                     continue
+
                 etype = event.get("type", "")
-                log.debug("OpenAI event #%d: %s", events_seen, etype)
+                # Log every event at INFO for debugging — tighten to DEBUG once stable
+                log.info("OpenAI ← event #%d: %s", events_seen, etype)
 
                 if etype == "session.created":
-                    log.info("OpenAI session.created ✓  id=%s",
-                             event.get("session", {}).get("id"))
+                    sess = event.get("session", {})
+                    log.info(
+                        "OpenAI session.created ✓  id=%s  model=%s  "
+                        "input_fmt=%s  output_fmt=%s  vad=%s",
+                        sess.get("id"), sess.get("model"),
+                        sess.get("input_audio_format"), sess.get("output_audio_format"),
+                        sess.get("turn_detection", {}).get("type"),
+                    )
 
                 elif etype == "session.updated":
-                    log.info("OpenAI session.updated")
+                    sess = event.get("session", {})
+                    log.info(
+                        "OpenAI session.updated  input_fmt=%s  output_fmt=%s  vad=%s",
+                        sess.get("input_audio_format"), sess.get("output_audio_format"),
+                        sess.get("turn_detection", {}).get("type"),
+                    )
 
-                elif etype == "response.output_audio.delta":
+                elif etype == "response.audio.delta":
+                    # Server streams base64 audio chunks
                     audio_bytes = base64.b64decode(event.get("delta", ""))
                     self._openai_audio_chunks += 1
                     if self._openai_audio_chunks == 1:
-                        log.info("Primer audio de OpenAI — %d bytes", len(audio_bytes))
+                        log.info("Primer audio de OpenAI — %d bytes  response_id=%s",
+                                 len(audio_bytes), event.get("response_id"))
+                    elif self._openai_audio_chunks % 50 == 0:
+                        log.debug("OpenAI audio chunks=%d", self._openai_audio_chunks)
                     if self._streamer:
                         await self._streamer.queue_audio(audio_bytes)
 
-                elif etype == "response.output_audio.done":
-                    log.info("OpenAI audio_done (chunks=%d)", self._openai_audio_chunks)
+                elif etype == "response.audio.done":
+                    log.info("OpenAI response.audio.done  chunks=%d  response_id=%s",
+                             self._openai_audio_chunks, event.get("response_id"))
                     if self._streamer:
                         await self._streamer.mark_last()
+                    self._openai_audio_chunks = 0
 
                 elif etype == "input_audio_buffer.speech_started":
-                    log.info("OpenAI: usuario habló — barge-in")
+                    log.info("OpenAI: speech_started — barge-in  audio_start_ms=%s",
+                             event.get("audio_start_ms"))
                     if self._streamer:
                         await self._streamer.barge_in()
 
+                elif etype == "input_audio_buffer.speech_stopped":
+                    log.info("OpenAI: speech_stopped  audio_end_ms=%s",
+                             event.get("audio_end_ms"))
+
+                elif etype == "input_audio_buffer.committed":
+                    log.info("OpenAI: audio buffer committed  item_id=%s",
+                             event.get("item_id"))
+
+                elif etype == "response.created":
+                    log.info("OpenAI: response.created  id=%s  status=%s",
+                             event.get("response", {}).get("id"),
+                             event.get("response", {}).get("status"))
+
+                elif etype == "response.done":
+                    resp = event.get("response", {})
+                    log.info("OpenAI: response.done  id=%s  status=%s  usage=%s",
+                             resp.get("id"), resp.get("status"), resp.get("usage"))
+
+                elif etype == "response.output_item.added":
+                    log.debug("OpenAI: output_item.added  item=%s",
+                              event.get("item", {}).get("type"))
+
+                elif etype == "response.content_part.added":
+                    log.debug("OpenAI: content_part.added  type=%s",
+                              event.get("part", {}).get("type"))
+
+                elif etype == "response.audio_transcript.delta":
+                    log.debug("OpenAI transcript delta: %s", event.get("delta", ""))
+
+                elif etype == "response.audio_transcript.done":
+                    log.info("OpenAI transcript: %s", event.get("transcript", ""))
+
                 elif etype == "error":
-                    log.error("OpenAI API error: %s", event)
+                    log.error("OpenAI API error: %s", json.dumps(event, indent=2))
 
                 else:
-                    log.debug("OpenAI event (no manejado): %s", etype)
+                    log.info("OpenAI event (no manejado): %s  full=%s",
+                             etype, json.dumps(event))
 
         except asyncio.CancelledError:
             log.info("OpenAI event loop cancelado (%d eventos)", events_seen)
@@ -784,6 +856,8 @@ class AvayaHandler:
         self._last_flush = time.monotonic()
         self._audio_bytes_tx += len(data)
         b64 = base64.b64encode(data).decode()
+        if self._audio_bytes_tx == len(data):
+            log.info("Primer flush → OpenAI  bytes=%d  b64_len=%d", len(data), len(b64))
         await self._openai_send({"type": "input_audio_buffer.append", "audio": b64})
 
     async def _openai_send(self, msg: dict) -> None:
