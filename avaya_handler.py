@@ -776,21 +776,21 @@ class AvayaHandler:
                         sess.get("turn_detection", {}).get("type"),
                     )
 
-                elif etype == "response.audio.delta":
-                    # Server streams base64 audio chunks
+                elif etype in ("response.output_audio.delta", "response.audio.delta"):
+                    # Server streams base64 audio chunks (event name varies by model/version)
                     audio_bytes = base64.b64decode(event.get("delta", ""))
                     self._openai_audio_chunks += 1
                     if self._openai_audio_chunks == 1:
-                        log.info("Primer audio de OpenAI — %d bytes  response_id=%s",
-                                 len(audio_bytes), event.get("response_id"))
+                        log.info("Primer audio de OpenAI — %d bytes  response_id=%s  event=%s",
+                                 len(audio_bytes), event.get("response_id"), etype)
                     elif self._openai_audio_chunks % 50 == 0:
                         log.debug("OpenAI audio chunks=%d", self._openai_audio_chunks)
                     if self._streamer:
                         await self._streamer.queue_audio(audio_bytes)
 
-                elif etype == "response.audio.done":
-                    log.info("OpenAI response.audio.done  chunks=%d  response_id=%s",
-                             self._openai_audio_chunks, event.get("response_id"))
+                elif etype in ("response.output_audio.done", "response.audio.done"):
+                    log.info("OpenAI audio done  chunks=%d  response_id=%s  event=%s",
+                             self._openai_audio_chunks, event.get("response_id"), etype)
                     if self._streamer:
                         await self._streamer.mark_last()
                     self._openai_audio_chunks = 0
