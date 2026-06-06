@@ -429,10 +429,15 @@ class AvayaHandler:
     # ── JSON / control message handling ─────────────────────────
 
     async def _handle_text(self, text: str) -> None:
+        # Strip UTF-8 BOM if present (some Avaya versions add it)
+        text = text.lstrip("﻿")
         try:
             msg: dict[str, Any] = json.loads(text)
-        except json.JSONDecodeError:
-            log.warning("Received non-JSON text frame: %s", text[:500])
+        except json.JSONDecodeError as exc:
+            log.error(
+                "JSON parse error at pos %d — %s\nFull text (%d chars): %s",
+                exc.pos, exc.msg, len(text), text,
+            )
             return
 
         msg_type = msg.get("type", "<no-type>")
@@ -441,6 +446,8 @@ class AvayaHandler:
 
         if msg_type == "session.start":
             await self._on_session_start(msg)
+        elif msg_type == "session.ping":
+            await self._on_session_ping(msg)
         elif msg_type == "session.end":
             await self._on_session_end(msg)
         elif msg_type.endswith(".start"):
@@ -455,8 +462,12 @@ class AvayaHandler:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
         log.info("session.start — sessionId=%s", self._session_id)
 
+        # mediaTransports and mediaEndpoints live inside msg["payload"]
+        payload_body = msg.get("payload", {})
+        log.debug("session.start payload keys: %s", list(payload_body.keys()))
+
         # ── Pick transport encoding and codec from mediaTransports ──
-        transports = msg.get("mediaTransports", [])
+        transports = payload_body.get("mediaTransports", [])
         selected_transport_type = "avaya-wss"
         selected_encoding       = "binary"
         selected_codec_entry    = ["audio", "PCMU", 8000, 1]
@@ -475,6 +486,8 @@ class AvayaHandler:
                     break
             else:
                 selected_codec_entry = codecs[0] if codecs else selected_codec_entry
+        else:
+            log.warning("No mediaTransports in session.start payload — using PCMU defaults")
 
         log.info(
             "  transport=%s  encoding=%s  codec=%s",
@@ -483,7 +496,7 @@ class AvayaHandler:
 
         # ── Assign bid counters for each endpoint (mirrors byobot_server.py:1790-1853) ──
         bid_counter = 0
-        for i, ep in enumerate(msg.get("mediaEndpoints", [])):
+        for i, ep in enumerate(payload_body.get("mediaEndpoints", [])):
             ep_id   = ep.get("endpointId", ep.get("id", str(uuid.uuid4())))
             flows   = ep.get("flows", {})
             audio   = flows.get("audio", {})
@@ -526,6 +539,17 @@ class AvayaHandler:
         log.info("→ SEND [session.started]  codec=%s  encoding=%s",
                  self._codec_name(), selected_encoding)
         log.debug("Full response:\n%s", json.dumps(resp, indent=2))
+        await self._send_json(resp)
+
+    async def _on_session_ping(self, msg: dict) -> None:
+        resp = {
+            "version":     msg.get("version", "1.0.0"),
+            "type":        "session.pong",
+            "sessionId":   self._session_id or msg.get("sessionId", ""),
+            "sequenceNum": self._next_json_seq(),
+            "timestamp":   _iso_now(),
+        }
+        log.info("→ SEND [session.pong]")
         await self._send_json(resp)
 
     async def _on_service_start(self, msg: dict) -> None:
