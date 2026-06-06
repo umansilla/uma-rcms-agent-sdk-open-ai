@@ -712,7 +712,8 @@ class AvayaHandler:
                 "playback_tracker": self.playback_tracker,
             }
             log.debug("model_config: %s", json.dumps(
-                {k: v for k, v in model_config.items() if k != "api_key"}, indent=2
+                {k: v for k, v in model_config.items()
+                 if k not in ("api_key", "playback_tracker")}, indent=2
             ))
 
         
