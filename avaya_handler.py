@@ -432,10 +432,13 @@ class AvayaHandler:
         # Strip UTF-8 BOM if present (some Avaya versions add it)
         text = text.lstrip("﻿")
         try:
-            msg: dict[str, Any] = json.loads(text)
+            # strict=False allows control characters (0x00-0x1F) inside JSON strings.
+            # Avaya's session.start payload embeds context data that may contain
+            # literal newlines/tabs, which Python's strict JSON parser rejects.
+            msg: dict[str, Any] = json.loads(text, strict=False)
         except json.JSONDecodeError as exc:
             log.error(
-                "JSON parse error at pos %d — %s\nFull text (%d chars): %s",
+                "JSON parse error at pos %d — %s\nFull text (%d chars):\n%s",
                 exc.pos, exc.msg, len(text), text,
             )
             return
