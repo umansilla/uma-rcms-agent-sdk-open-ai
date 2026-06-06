@@ -430,36 +430,45 @@ class AvayaHandler:
 
     async def _handle_text(self, text: str) -> None:
         # Strip UTF-8 BOM if present (some Avaya versions add it)
-        text = text.lstrip("﻿")
-        try:
-            # strict=False allows control characters (0x00-0x1F) inside JSON strings.
-            # Avaya's session.start payload embeds context data that may contain
-            # literal newlines/tabs, which Python's strict JSON parser rejects.
-            msg: dict[str, Any] = json.loads(text, strict=False)
-        except json.JSONDecodeError as exc:
-            log.error(
-                "JSON parse error at pos %d — %s\nFull text (%d chars):\n%s",
-                exc.pos, exc.msg, len(text), text,
-            )
-            return
+        text = text.lstrip("﻿").strip()
 
-        msg_type = msg.get("type", "<no-type>")
-        log.info("← RECV [%s]", msg_type)
-        log.debug("Full message:\n%s", json.dumps(msg, indent=2))
+        # Avaya sends multiple JSON objects concatenated in one WS frame
+        # (e.g. session.start + bot.start together). Use raw_decode to handle each one.
+        # strict=False additionally allows literal control chars inside JSON strings.
+        decoder = json.JSONDecoder(strict=False)
+        pos = 0
+        while pos < len(text):
+            try:
+                msg, pos = decoder.raw_decode(text, pos)
+            except json.JSONDecodeError as exc:
+                log.error(
+                    "JSON parse error at offset %d (absolute pos %d) — %s\n"
+                    "Remaining snippet: %s",
+                    exc.pos, pos + exc.pos, exc.msg, text[pos: pos + 200],
+                )
+                break
 
-        if msg_type == "session.start":
-            await self._on_session_start(msg)
-        elif msg_type == "session.ping":
-            await self._on_session_ping(msg)
-        elif msg_type == "session.end":
-            await self._on_session_end(msg)
-        elif msg_type.endswith(".start"):
-            await self._on_service_start(msg)
-        elif msg_type.endswith(".end"):
-            await self._on_service_end(msg)
-        else:
-            log.warning("Unhandled message type '%s'. Full message:\n%s",
-                        msg_type, json.dumps(msg, indent=2))
+            # skip whitespace between objects
+            while pos < len(text) and text[pos] in " \t\n\r":
+                pos += 1
+
+            msg_type = msg.get("type", "<no-type>")
+            log.info("← RECV [%s]", msg_type)
+            log.debug("Full message:\n%s", json.dumps(msg, indent=2))
+
+            if msg_type == "session.start":
+                await self._on_session_start(msg)
+            elif msg_type == "session.ping":
+                await self._on_session_ping(msg)
+            elif msg_type == "session.end":
+                await self._on_session_end(msg)
+            elif msg_type.endswith(".start"):
+                await self._on_service_start(msg)
+            elif msg_type.endswith(".end"):
+                await self._on_service_end(msg)
+            else:
+                log.warning("Unhandled message type '%s'. Full message:\n%s",
+                            msg_type, json.dumps(msg, indent=2))
 
     async def _on_session_start(self, msg: dict) -> None:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
@@ -497,8 +506,8 @@ class AvayaHandler:
             selected_transport_type, selected_encoding, self._codec_name(),
         )
 
-        # ── Assign bid counters for each endpoint (mirrors byobot_server.py:1790-1853) ──
-        bid_counter = 0
+        # ── Read bid assignments directly from mediaEndpoints (Avaya provides them) ──
+        # Avaya sends: egress.bid (caller→bot) and ingress.bid (bot→caller)
         for i, ep in enumerate(payload_body.get("mediaEndpoints", [])):
             ep_id   = ep.get("endpointId", ep.get("id", str(uuid.uuid4())))
             flows   = ep.get("flows", {})
@@ -509,19 +518,21 @@ class AvayaHandler:
             if not self._endpoint_id:
                 self._endpoint_id = ep_id
 
-            sources = [s for s in egress.get("sources", []) if s.lower() != "none"]
-            if sources:
-                egress_bid = bid_counter
-                bid_counter += 1
-                log.info("  endpoint[%d] id=%s  egress_bid=%d  sources=%s",
-                         i, ep_id, egress_bid, sources)
-
+            egress_bid = egress.get("bid")
+            ingress_bid = ingress.get("bid")
             ingress_target = ingress.get("target", [])
-            if ingress_target and ingress_target != ["none"]:
-                ingress_bid = bid_counter
-                bid_counter += 1
+            supports_ingress = bool(
+                ingress_target and ingress_target != ["none"] and ingress_bid is not None
+            )
+
+            log.info(
+                "  endpoint[%d] id=%s  egress_bid=%s  sources=%s  ingress_bid=%s  target=%s",
+                i, ep_id, egress_bid, egress.get("sources", []),
+                ingress_bid, ingress_target,
+            )
+
+            if supports_ingress:
                 self._ingress_bid_by_endpoint[ep_id] = ingress_bid
-                log.info("  endpoint[%d] id=%s  ingress_bid=%d", i, ep_id, ingress_bid)
 
         log.info("  ingress_bids=%s", self._ingress_bid_by_endpoint)
 
@@ -677,33 +688,34 @@ class AvayaHandler:
     # ── OpenAI Realtime session ──────────────────────────────────
 
     async def _start_openai_session(self) -> None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
-            raise ValueError("OPENAI_API_KEY environment variable is required")
-
-        model_name = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
-        log.info("Starting OpenAI Realtime session — model=%s", model_name)
-
-        model_config = {
-            "api_key": api_key,
-            "initial_model_settings": {
-                "model_name":          model_name,
-                "input_audio_format":  "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "turn_detection": {
-                    "type":               "semantic_vad",
-                    "interrupt_response": True,
-                    "create_response":    True,
-                },
-            },
-            "playback_tracker": self.playback_tracker,
-        }
-        log.debug("model_config: %s", json.dumps(
-            {k: v for k, v in model_config.items() if k != "api_key"}, indent=2
-        ))
-
         try:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
+                raise ValueError("OPENAI_API_KEY environment variable is required")
+
+            model_name = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
+            log.info("Starting OpenAI Realtime session — model=%s", model_name)
+
+            model_config = {
+                "api_key": api_key,
+                "initial_model_settings": {
+                    "model_name":          model_name,
+                    "input_audio_format":  "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": {
+                        "type":               "semantic_vad",
+                        "interrupt_response": True,
+                        "create_response":    True,
+                    },
+                },
+                "playback_tracker": self.playback_tracker,
+            }
+            log.debug("model_config: %s", json.dumps(
+                {k: v for k, v in model_config.items() if k != "api_key"}, indent=2
+            ))
+
+        
             runner = RealtimeRunner(_agent)
             self.session = await runner.run(model_config=model_config)
             await self.session.enter()

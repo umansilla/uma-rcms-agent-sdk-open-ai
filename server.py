@@ -99,9 +99,10 @@ async def media_stream(websocket: WebSocket):
             await websocket.close(code=4403, reason="Invalid or expired JWT")
             return
 
-    log.info("Incoming WebSocket connection — path=%s", websocket.url.path)
-    handler = AvayaHandler(websocket)
+   
     try:
+        log.info("Incoming WebSocket connection — path=%s", websocket.url.path)
+        handler = AvayaHandler(websocket)
         await handler.start()
         await handler.wait_until_done()
     except WebSocketDisconnect:
