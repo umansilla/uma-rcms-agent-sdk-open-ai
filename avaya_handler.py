@@ -429,17 +429,13 @@ class AvayaHandler:
     # ── JSON / control message handling ─────────────────────────
 
     async def _handle_text(self, text: str) -> None:
-        # Strip UTF-8 BOM if present (some Avaya versions add it)
+        # Strip UTF-8 BOM if present
         text = text.lstrip("﻿")
-        try:
-            msg: dict[str, Any] = json.loads(text)
-        except json.JSONDecodeError as exc:
-            log.error(
-                "JSON parse error at pos %d — %s\nFull text (%d chars): %s",
-                exc.pos, exc.msg, len(text), text,
-            )
-            return
+        # Avaya may pack several JSON objects back-to-back in one frame
+        for msg in _iter_json_objects(text):
+            await self._dispatch_msg(msg)
 
+    async def _dispatch_msg(self, msg: dict) -> None:
         msg_type = msg.get("type", "<no-type>")
         log.info("← RECV [%s]", msg_type)
         log.debug("Full message:\n%s", json.dumps(msg, indent=2))
@@ -494,8 +490,7 @@ class AvayaHandler:
             selected_transport_type, selected_encoding, self._codec_name(),
         )
 
-        # ── Assign bid counters for each endpoint (mirrors byobot_server.py:1790-1853) ──
-        bid_counter = 0
+        # ── Read bids directly from the message (Avaya pre-assigns them) ──
         for i, ep in enumerate(payload_body.get("mediaEndpoints", [])):
             ep_id   = ep.get("endpointId", ep.get("id", str(uuid.uuid4())))
             flows   = ep.get("flows", {})
@@ -506,19 +501,18 @@ class AvayaHandler:
             if not self._endpoint_id:
                 self._endpoint_id = ep_id
 
-            sources = [s for s in egress.get("sources", []) if s.lower() != "none"]
-            if sources:
-                egress_bid = bid_counter
-                bid_counter += 1
-                log.info("  endpoint[%d] id=%s  egress_bid=%d  sources=%s",
-                         i, ep_id, egress_bid, sources)
+            egress_bid = egress.get("bid")
+            log.info("  endpoint[%d] id=%s  egress_bid=%s  sources=%s",
+                     i, ep_id, egress_bid, egress.get("sources", []))
 
             ingress_target = ingress.get("target", [])
             if ingress_target and ingress_target != ["none"]:
-                ingress_bid = bid_counter
-                bid_counter += 1
-                self._ingress_bid_by_endpoint[ep_id] = ingress_bid
-                log.info("  endpoint[%d] id=%s  ingress_bid=%d", i, ep_id, ingress_bid)
+                ingress_bid = ingress.get("bid")
+                if ingress_bid is not None:
+                    self._ingress_bid_by_endpoint[ep_id] = ingress_bid
+                    log.info("  endpoint[%d] id=%s  ingress_bid=%d", i, ep_id, ingress_bid)
+                else:
+                    log.warning("  endpoint[%d] id=%s  no ingress bid in message", i, ep_id)
 
         log.info("  ingress_bids=%s", self._ingress_bid_by_endpoint)
 
@@ -817,6 +811,24 @@ class AvayaHandler:
 # ─────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────
+
+def _iter_json_objects(text: str):
+    """Yield every JSON object packed back-to-back in *text*.
+
+    Avaya RCMS sends multiple control messages concatenated in a single
+    WebSocket text frame (e.g. session.start immediately followed by bot.start).
+    json.loads would fail with 'Extra data'; this generator decodes them all.
+    """
+    decoder = json.JSONDecoder()
+    text = text.lstrip()
+    while text:
+        try:
+            obj, idx = decoder.raw_decode(text)
+        except json.JSONDecodeError:
+            break
+        yield obj
+        text = text[idx:].lstrip()
+
 
 def _bytes_to_uuid(b: bytes) -> str:
     try:
