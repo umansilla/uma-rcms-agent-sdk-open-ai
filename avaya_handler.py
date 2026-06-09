@@ -714,24 +714,56 @@ class AvayaHandler:
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
         instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
         session_cfg = {
-            "type": "realtime",
-            "model": "gpt-realtime-mini",
-            # Bloquea la salida a audio (agrega "text" si también deseas texto)
-            "output_modalities": ["audio"],
+        "type": "realtime",
+        "model": "gpt-realtime-mini",
+        "output_modalities": ["audio"],
+        "tools": [
+            {
+                "type": "function",
+                "name": "transferir_a_agente",
+                "description": "Llama a esta función inmediatamente cuando el usuario pida hablar con un humano, agente, operador, asesor o representante, o si manifiesta frustración que requiera escalamiento.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "motivo": {
+                            "type": "string",
+                            "description": "Breve resumen de la conversación compelta."
+                        }
+                    },
+                    "required": ["motivo"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "finalizar_llamada",
+                "description": "Llama a esta función cuando el usuario se despida, indique que su problema está resuelto, o pida explícitamente colgar o terminar la llamada.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+            ],
+            "tool_choice": "auto",
             "audio": {
                 "input": {
                     "format": {
                         "type": "audio/pcmu"
                     },
                     "turn_detection": {
-                        "type": "server_vad"
-                    }
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "create_response": True,
+                        "interrupt_response": False
+                    }    
                 },
                 "output": {
                     "format": {
                         "type": "audio/pcmu",
                     },
-                    "voice": "marin",
+                    "voice": "alloy" # Nota: "marin" no es una voz estándar de OpenAI, revisa si querías usar alloy, echo, fable, onyx, nova o shimmer.
                 }
             }
         }
@@ -754,7 +786,7 @@ class AvayaHandler:
         log.info("_IngressStreamer created  bid=%d  endpoint=%s", bid, self._endpoint_id)
 
         self._tasks.append(asyncio.create_task(self._openai_event_loop()))
-        self._tasks.append(asyncio.create_task(self._buffer_flush_loop()))
+        #self._tasks.append(asyncio.create_task(self._buffer_flush_loop()))
         log.info("Background tasks started (event loop + buffer flush)")
 
     async def _openai_event_loop(self) -> None:
@@ -855,6 +887,64 @@ class AvayaHandler:
                         err.get("type"), err.get("code"),
                         err.get("message"), err.get("param"),
                     )
+
+                elif etype == "response.function_call_arguments.done":
+                    fn_name = event.get("name", "")
+                    raw_args = event.get("arguments", "") or "{}"
+                    call_id = event.get("call_id")
+                    try:
+                        fn_args = json.loads(raw_args)
+                    except json.JSONDecodeError as exc:
+                        log.error(
+                            "OpenAI function_call_arguments.done — JSON inválido "
+                            "name=%s err=%s raw=%r", fn_name, exc, raw_args,
+                        )
+                        fn_args = {}
+
+                    log.info("OpenAI → tool call  name=%s  call_id=%s  args=%s",
+                             fn_name, call_id, fn_args)
+
+                    if fn_name == "transferir_a_agente":
+                        motivo = fn_args.get("motivo", "")
+                        log.info("Transfer a agente solicitada — motivo=%s", motivo)
+                        resp = {
+                            "version":     "1.0.0",
+                            "type":        "bot.feature",
+                            "sessionId":   self._session_id,
+                            "sequenceNum": self._next_json_seq(),
+                            "timestamp":   _iso_now(),
+                            "payload": {
+                                "ftype": "LIVE_AGENT_HANDOFF",
+                                "liveAgentHandoff": {
+                                    "queueId": "default-queue",
+                                },
+                            },
+                        }
+                        log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
+                        await self._send_json(resp)
+
+                    elif fn_name == "finalizar_llamada":
+                        log.info("Finalizar llamada solicitada por el modelo")
+                        resp = {
+                            "version":     "1.0.0",
+                            "type":        "bot.end",
+                            "sessionId":   self._session_id,
+                            "sequenceNum": self._next_json_seq(),
+                            "timestamp":   _iso_now(),
+                            "payload": {
+                                "endpointId": self._endpoint_id,
+                                "status": {
+                                    "code":   200,
+                                    "reason": "ENDPOINT_RELEASED",
+                                },
+                            },
+                        }
+                        log.info("→ SEND [bot.end ENDPOINT_RELEASED]")
+                        await self._send_json(resp)
+
+                    else:
+                        log.warning("Tool call con nombre no manejado: %s  args=%s",
+                                    fn_name, fn_args)
 
                 else:
                     log.info("OpenAI event (no manejado): %s  full=%s",
