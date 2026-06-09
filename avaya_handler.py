@@ -766,9 +766,7 @@ class AvayaHandler:
                     "voice": "alloy" # Nota: "marin" no es una voz estándar de OpenAI, revisa si querías usar alloy, echo, fable, onyx, nova o shimmer.
                 }
             },
-            "prompt" :{
-                "instructions": instructions
-            }
+            "instructions": instructions
         }
         log.info(
             "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=server_vad",
