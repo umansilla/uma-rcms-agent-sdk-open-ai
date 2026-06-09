@@ -712,6 +712,7 @@ class AvayaHandler:
 
         # g711_ulaw = PCMU (8 kHz, µ-law), g711_alaw = PCMA
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
+        eagerness = os.getenv("OPENAI_VAD_EAGERNESS", "auto")
         instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
         welcome_instructions = os.getenv(
             "OPENAI_WELCOME_INSTRUCTIONS",
@@ -755,13 +756,11 @@ class AvayaHandler:
                         "type": "audio/pcmu"
                     },
                     "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        "type": "semantic_vad",
+                        "eagerness": eagerness,
                         "create_response": True,
                         "interrupt_response": False
-                    }    
+                    }
                 },
                 "output": {
                     "format": {
@@ -773,8 +772,8 @@ class AvayaHandler:
             "instructions": instructions
         }
         log.info(
-            "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=server_vad",
-            model_name, audio_fmt, audio_fmt,
+            "→ SEND [session.update]  model=%s  input_fmt=%s  output_fmt=%s  vad=semantic_vad  eagerness=%s",
+            model_name, audio_fmt, audio_fmt, eagerness,
         )
         await self._openai_send({"type": "session.update", "session": session_cfg})
 
