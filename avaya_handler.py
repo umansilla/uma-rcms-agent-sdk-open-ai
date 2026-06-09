@@ -713,6 +713,10 @@ class AvayaHandler:
         # g711_ulaw = PCMU (8 kHz, µ-law), g711_alaw = PCMA
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
         instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
+        welcome_instructions = os.getenv(
+            "OPENAI_WELCOME_INSTRUCTIONS",
+            "Inicia la conversación inmediatamente mencionando \"Bienvenido a AT&T ¿Cómo te puedo ayudar? el día de hoy.\"",
+        )
         session_cfg = {
         "type": "realtime",
         "model": "gpt-realtime-mini",
@@ -779,7 +783,7 @@ class AvayaHandler:
         await self._openai_send({
             "type": "response.create",
             "response": {
-                "instructions": "Inicia la conversación saludando al usuario inmediatamente siguiendo tus instrucciones generales."
+                "instructions": welcome_instructions
             }
         })
 
