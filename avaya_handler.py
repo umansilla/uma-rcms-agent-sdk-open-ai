@@ -774,6 +774,15 @@ class AvayaHandler:
         )
         await self._openai_send({"type": "session.update", "session": session_cfg})
 
+        # Forzar saludo inicial sin esperar detección de voz del usuario
+        log.info("→ SEND [response.create]  forzando saludo inicial")
+        await self._openai_send({
+            "type": "response.create",
+            "response": {
+                "instructions": "Inicia la conversación saludando al usuario inmediatamente siguiendo tus instrucciones generales."
+            }
+        })
+
         # Build streamer using the ingress bid for this endpoint
         bid = self._ingress_bid_by_endpoint.get(self._endpoint_id)
         if bid is None:
