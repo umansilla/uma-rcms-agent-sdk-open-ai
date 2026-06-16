@@ -440,7 +440,7 @@ class AvayaHandler:
                 await self._on_service_end(msg)
             else:
                 log.warning("Unhandled message type '%s'. Full message:\n%s",
-                            msg_type, json.dumps(msg, indent=2))
+                            msg_type, json.dumps(msg))
 
     async def _on_session_start(self, msg: dict) -> None:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
@@ -448,7 +448,7 @@ class AvayaHandler:
 
         # mediaTransports and mediaEndpoints live inside msg["payload"]
         payload_body = msg.get("payload", {})
-        log.info("UMA session payload:\n%s", json.dumps(payload_body, indent=2))
+        log.info("UMA session payload:\n%s", json.dumps(payload_body))
         log.debug("session.start payload keys: %s", list(payload_body.keys()))
 
         # ── Pick transport encoding and codec from mediaTransports ──
@@ -548,7 +548,7 @@ class AvayaHandler:
         msg_type    = msg.get("type", "")
         session_id  = msg.get("sessionId", self._session_id)
         payload     = msg.get("payload", {})
-        log.info("UMA session payload (type=%s):\n%s", msg_type, json.dumps(payload, indent=2))
+        log.info("UMA session payload (type=%s):\n%s", msg_type, json.dumps(payload))
         endpoint_id = payload.get("endpointId", self._endpoint_id)
         service     = msg.get("service", msg_type.replace(".start", ""))
 
