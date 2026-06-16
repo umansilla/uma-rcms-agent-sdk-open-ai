@@ -740,6 +740,21 @@ class AvayaHandler:
             },
             {
                 "type": "function",
+                "name": "iniciar_autenticacion",
+                "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "motivo": {
+                            "type": "string",
+                            "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA')."
+                        }
+                    },
+                    "required": ["motivo"]
+                }
+            },
+            {
+                "type": "function",
                 "name": "finalizar_llamada",
                 "description": "Llama a esta función cuando el usuario se despida, indique que su problema está resuelto, o pida explícitamente colgar o terminar la llamada.",
                 "parameters": {
@@ -929,6 +944,33 @@ class AvayaHandler:
                             "payload": {
                                 "ftype": "LIVE_AGENT_HANDOFF",
                                 "liveAgentHandoff": {
+                                    "context" : {
+                                        "agentic_term" : fn_name.upper(),
+                                        "agentic_summary" : motivo,
+                                    },
+                                    "queueId": "default-queue",
+                                },
+                            },
+                        }
+                        log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
+                        await self._send_json(resp)
+
+                    if fn_name == "iniciar_autenticacion":
+                        motivo = fn_args.get("motivo", "")
+                        log.info("Autenticación solicitada — motivo=%s", motivo)
+                        resp = {
+                            "version":     "1.0.0",
+                            "type":        "bot.feature",
+                            "sessionId":   self._session_id,
+                            "sequenceNum": self._next_json_seq(),
+                            "timestamp":   _iso_now(),
+                            "payload": {
+                                "ftype": "LIVE_AGENT_HANDOFF",
+                                "liveAgentHandoff": {
+                                    "context" : {
+                                        "agentic_term" : fn_name.upper(),
+                                        "agentic_reason" : motivo,
+                                    },
                                     "queueId": "default-queue",
                                 },
                             },
