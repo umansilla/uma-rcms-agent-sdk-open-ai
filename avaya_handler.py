@@ -560,7 +560,8 @@ class AvayaHandler:
 
         if self._openai_ws is None:
             log.info("No OpenAI session yet — initializing now")
-            await self._start_openai_session()
+            context = payload.get("context", {})
+            await self._start_openai_session(context)
         else:
             log.info("OpenAI session already active")
 
@@ -690,7 +691,9 @@ class AvayaHandler:
 
     # ── OpenAI Realtime session ──────────────────────────────────
 
-    async def _start_openai_session(self) -> None:
+    async def _start_openai_session(self, context: dict = None) -> None:
+        if context is None:
+            context = {}
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             log.error("OPENAI_API_KEY is not set — cannot start Realtime session")
@@ -714,12 +717,16 @@ class AvayaHandler:
 
         # g711_ulaw = PCMU (8 kHz, µ-law), g711_alaw = PCMA
         audio_fmt = "g711_ulaw" if self._codec_id == CODEC_PCMU else "g711_alaw"
-        eagerness = os.getenv("OPENAI_VAD_EAGERNESS", "auto")
-        instructions = os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!")
-        welcome_instructions = os.getenv(
+        eagerness = context.get("OPENAI_VAD_EAGERNESS", os.getenv("OPENAI_VAD_EAGERNESS", "auto"))
+        instructions = context.get("OPENAI_INSTRUCTIONS", os.getenv("OPENAI_INSTRUCTIONS", "Be extra nice today!"))
+        welcome_instructions = context.get(
             "OPENAI_WELCOME_INSTRUCTIONS",
-            "Inicia la conversación inmediatamente mencionando \"Bienvenido a AT&T ¿Cómo te puedo ayudar? el día de hoy.\"",
+            os.getenv(
+                "OPENAI_WELCOME_INSTRUCTIONS",
+                "Inicia la conversación inmediatamente mencionando \"Bienvenido a AVAYA ¿Cómo te puedo ayudar? el día de hoy.\"",
+            ),
         )
+        open_ai_voice = context.get("OPENAI_VOICE", os.getenv("OPENAI_VOICE", "alloy"))  # alloy, echo, fable, onyx, nova, shimmer
         session_cfg = {
         "type": "realtime",
         "model": "gpt-realtime-mini",
@@ -783,7 +790,7 @@ class AvayaHandler:
                     "format": {
                         "type": "audio/pcmu",
                     },
-                    "voice": "alloy" # Nota: "marin" no es una voz estándar de OpenAI, revisa si querías usar alloy, echo, fable, onyx, nova o shimmer.
+                    "voice": open_ai_voice  # Nota: "marin" no es una voz estándar de OpenAI, revisa si querías usar alloy, echo, fable, onyx, nova o shimmer.
                 }
             },
             "instructions": instructions
