@@ -747,7 +747,7 @@ class AvayaHandler:
                     "properties": {
                         "motivo": {
                             "type": "string",
-                            "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA')."
+                            "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA, BLOQUEAR')."
                         }
                     },
                     "required": ["motivo"]
