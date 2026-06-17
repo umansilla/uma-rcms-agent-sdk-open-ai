@@ -1012,7 +1012,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                        await self._send_json(resp)
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
 
                     if fn_name == "iniciar_autenticacion":
                         motivo = fn_args.get("motivo", "")
@@ -1035,7 +1035,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                        await self._send_json(resp)
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
 
                     elif fn_name == "finalizar_llamada":
                         log.info("Finalizar llamada solicitada por el modelo")
@@ -1054,7 +1054,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.end ENDPOINT_RELEASED]")
-                        await self._send_json(resp)
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
 
                     else:
                         log.warning("Tool call con nombre no manejado: %s  args=%s",
@@ -1122,6 +1122,16 @@ class AvayaHandler:
         log.warning("PCMU/PCMA not in offered codecs %s — using %s (may need conversion)",
                     offered, first)
         return first
+
+    async def _send_delayed_action(self, payload: dict, delay_seconds: float = 1.5) -> None:
+        """
+        Espera en segundo plano para permitir que Whisper termine
+        la transcripción del usuario y se envíe a Avaya primero.
+        """
+        log.info("Pausando %.1f seg para esperar la transcripción del usuario...", delay_seconds)
+        await asyncio.sleep(delay_seconds)
+        log.info("→ SEND (Delayed) [%s]", payload.get("type"))
+        await self._send_json(payload)
 
     async def _send_json(self, payload: dict) -> None:
         await self.ws.send_text(json.dumps(payload))
