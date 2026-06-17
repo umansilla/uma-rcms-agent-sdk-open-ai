@@ -1012,7 +1012,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
                     if fn_name == "iniciar_autenticacion":
                         motivo = fn_args.get("motivo", "")
@@ -1035,7 +1035,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
                     elif fn_name == "finalizar_llamada":
                         log.info("Finalizar llamada solicitada por el modelo")
@@ -1054,7 +1054,7 @@ class AvayaHandler:
                             },
                         }
                         log.info("→ SEND [bot.end ENDPOINT_RELEASED]")
-                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=1.5)))
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
                     else:
                         log.warning("Tool call con nombre no manejado: %s  args=%s",
@@ -1123,7 +1123,7 @@ class AvayaHandler:
                     offered, first)
         return first
 
-    async def _send_delayed_action(self, payload: dict, delay_seconds: float = 1.5) -> None:
+    async def _send_delayed_action(self, payload: dict, delay_seconds: float = 2.5) -> None:
         """
         Espera en segundo plano para permitir que Whisper termine
         la transcripción del usuario y se envíe a Avaya primero.
