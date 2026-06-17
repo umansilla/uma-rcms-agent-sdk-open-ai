@@ -779,6 +779,9 @@ class AvayaHandler:
                     "format": {
                         "type": "audio/pcmu"
                     },
+                    "transcription": {
+                        "model": "whisper-1"
+                    },
                     "turn_detection": {
                         "type": "semantic_vad",
                         "eagerness": eagerness,
@@ -915,7 +918,54 @@ class AvayaHandler:
                     log.debug("OpenAI transcript delta: %s", event.get("delta", ""))
 
                 elif etype == "response.audio_transcript.done":
-                    log.info("OpenAI transcript: %s", event.get("transcript", ""))
+                    texto = event.get("transcript", "")
+                    log.info("UMA _ BOT_ Transcript: %s", texto)
+                    resp = {
+                        "version":     "1.0.0",
+                        "type":        "bot.feature",
+                        "sessionId":   self._session_id,
+                        "sequenceNum": self._next_json_seq(),
+                        "timestamp":   _iso_now(),
+                        "payload": {
+                            "ftype": "TRANSCRIPT",
+                            "transcript": {
+                                "turnId":     event.get("response_id", ""),
+                                "speaker":    "BOT",
+                                "isFinal":    True,
+                                "text":       texto,
+                                "confidence": 0.99,
+                                "language":   "es-MX",
+                                "startTsMs":  int(time.time() * 1000),
+                                "context":    {},
+                            },
+                        },
+                    }
+                    await self._send_json(resp)
+
+                elif etype == "conversation.item.input_audio_transcription.completed":
+                    texto = event.get("transcript", "")
+                    log.info("UMA _ CUSTOMER _ Transcript: %s", texto)
+                    resp = {
+                        "version":     "1.0.0",
+                        "type":        "bot.feature",
+                        "sessionId":   self._session_id,
+                        "sequenceNum": self._next_json_seq(),
+                        "timestamp":   _iso_now(),
+                        "payload": {
+                            "ftype": "TRANSCRIPT",
+                            "transcript": {
+                                "turnId":     event.get("item_id", ""),
+                                "speaker":    "CUSTOMER",
+                                "isFinal":    True,
+                                "text":       texto,
+                                "confidence": 0.99,
+                                "language":   "es-MX",
+                                "startTsMs":  int(time.time() * 1000),
+                                "context":    {},
+                            },
+                        },
+                    }
+                    await self._send_json(resp)
 
                 elif etype == "error":
                     err = event.get("error", event)
