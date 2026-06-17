@@ -735,7 +735,7 @@ class AvayaHandler:
             {
                 "type": "function",
                 "name": "transferir_a_agente",
-                "description": "Llama a esta función inmediatamente cuando el usuario pida hablar con un humano, agente, operador, asesor o representante, o si manifiesta frustración que requiera escalamiento.",
+                "description": "Llama a esta función inmediatamente cuando el usuario pida hablar con un humano, agente, operador, asesor o representante, o si manifiesta frustración que requiera escalamiento. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -750,7 +750,7 @@ class AvayaHandler:
             {
                 "type": "function",
                 "name": "iniciar_autenticacion",
-                "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla.",
+                "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -765,7 +765,7 @@ class AvayaHandler:
             {
                 "type": "function",
                 "name": "finalizar_llamada",
-                "description": "Llama a esta función cuando el usuario se despida, indique que su problema está resuelto, o pida explícitamente colgar o terminar la llamada.",
+                "description": "Llama a esta función cuando el usuario se despida, indique que su problema está resuelto, o pida explícitamente colgar o terminar la llamada. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
                 "parameters": {
                     "type": "object",
                     "properties": {},
