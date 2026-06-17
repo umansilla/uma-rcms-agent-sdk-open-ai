@@ -917,7 +917,7 @@ class AvayaHandler:
                 elif etype == "response.audio_transcript.delta":
                     log.debug("OpenAI transcript delta: %s", event.get("delta", ""))
 
-                elif etype == "response.audio_transcript.done":
+                elif etype == "response.output_audio_transcript.done":
                     texto = event.get("transcript", "")
                     log.info("UMA _ BOT_ Transcript: %s", texto)
                     resp = {
