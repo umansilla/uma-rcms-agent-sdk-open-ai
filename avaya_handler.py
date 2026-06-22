@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime, UTC
 from typing import Any
 
+import aiohttp
 import websockets
 from fastapi import WebSocket
 
@@ -36,6 +37,24 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("avaya_bridge")
+
+# ─────────────────────────────────────────────────────────────────
+# External API credentials / configuration
+# ─────────────────────────────────────────────────────────────────
+
+JOURNEYID_TOKEN         = os.getenv("JOURNEYID_TOKEN", "")
+JOURNEYID_PIPELINE      = os.getenv("JOURNEYID_PIPELINE_KEY", "ab48a335-1eed-4d0b-84e4-2d1cfa4e439f")
+JOURNEYID_CALLBACK_BASE = os.getenv(
+    "JOURNEYID_CALLBACK_BASE",
+    "https://uma-rcms-agent-sdk-open-ai.onrender.com",
+)
+TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER  = os.getenv("TWILIO_FROM_NUMBER", "+19705174322")
+
+# Sesiones activas indexadas por _session_id (para que el webhook
+# de JourneyID encuentre el handler vivo y le inyecte mensajes).
+active_sessions: dict[str, "AvayaHandler"] = {}
 
 # ─────────────────────────────────────────────────────────────────
 # Binary frame constants
@@ -377,6 +396,8 @@ class AvayaHandler:
             log.error("Receive loop crashed: %s\n%s", exc, traceback.format_exc())
 
     async def cleanup(self) -> None:
+        if self._session_id:
+            active_sessions.pop(self._session_id, None)
         if self._streamer:
             await self._streamer.stop()
         if self._openai_ws is not None:
@@ -444,6 +465,7 @@ class AvayaHandler:
 
     async def _on_session_start(self, msg: dict) -> None:
         self._session_id = msg.get("sessionId", str(uuid.uuid4()))
+        active_sessions[self._session_id] = self
         log.info("session.start — sessionId=%s", self._session_id)
 
         # mediaTransports and mediaEndpoints live inside msg["payload"]
@@ -747,21 +769,21 @@ class AvayaHandler:
                     "required": ["motivo"]
                 }
             },
-            {
-                "type": "function",
-                "name": "iniciar_autenticacion",
-                "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "motivo": {
-                            "type": "string",
-                            "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA, BLOQUEAR')."
-                        }
-                    },
-                    "required": ["motivo"]
-                }
-            },
+            # {
+            #     "type": "function",
+            #     "name": "iniciar_autenticacion",
+            #     "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
+            #     "parameters": {
+            #         "type": "object",
+            #         "properties": {
+            #             "motivo": {
+            #                 "type": "string",
+            #                 "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA, BLOQUEAR')."
+            #             }
+            #         },
+            #         "required": ["motivo"]
+            #     }
+            # },
             {
                 "type": "function",
                 "name": "finalizar_llamada",
@@ -770,6 +792,26 @@ class AvayaHandler:
                     "type": "object",
                     "properties": {},
                     "required": []
+                }
+            },
+            {
+                "type": "function",
+                "name": "iniciar_bloqueo_linea",
+                "description": (
+                    "Llama a esta función para iniciar el flujo de bloqueo seguro de una línea telefónica. "
+                    "ANTES de llamarla, DEBES: (1) pedirle al usuario su número de teléfono a 10 dígitos, "
+                    "(2) repetírselo y pedirle que lo confirme explícitamente. Solo cuando el usuario "
+                    "confirme el número procede a invocar la herramient; el sistema te indicará qué decir a continuación."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "numero_telefono": {
+                            "type": "string",
+                            "description": "Número de 10 dígitos confirmado por el usuario, solo dígitos, sin lada país."
+                        }
+                    },
+                    "required": ["numero_telefono"]
                 }
             }
             ],
@@ -1014,28 +1056,28 @@ class AvayaHandler:
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
                         self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
-                    if fn_name == "iniciar_autenticacion":
-                        motivo = fn_args.get("motivo", "")
-                        log.info("Autenticación solicitada — motivo=%s", motivo)
-                        resp = {
-                            "version":     "1.0.0",
-                            "type":        "bot.feature",
-                            "sessionId":   self._session_id,
-                            "sequenceNum": self._next_json_seq(),
-                            "timestamp":   _iso_now(),
-                            "payload": {
-                                "ftype": "LIVE_AGENT_HANDOFF",
-                                "liveAgentHandoff": {
-                                    "context" : {
-                                        "agentic_term" : fn_name.upper(),
-                                        "agentic_reason" : motivo,
-                                    },
-                                    "queueId": "default-queue",
-                                },
-                            },
-                        }
-                        log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
+                    # if fn_name == "iniciar_autenticacion":
+                    #     motivo = fn_args.get("motivo", "")
+                    #     log.info("Autenticación solicitada — motivo=%s", motivo)
+                    #     resp = {
+                    #         "version":     "1.0.0",
+                    #         "type":        "bot.feature",
+                    #         "sessionId":   self._session_id,
+                    #         "sequenceNum": self._next_json_seq(),
+                    #         "timestamp":   _iso_now(),
+                    #         "payload": {
+                    #             "ftype": "LIVE_AGENT_HANDOFF",
+                    #             "liveAgentHandoff": {
+                    #                 "context" : {
+                    #                     "agentic_term" : fn_name.upper(),
+                    #                     "agentic_reason" : motivo,
+                    #                 },
+                    #                 "queueId": "default-queue",
+                    #             },
+                    #         },
+                    #     }
+                    #     log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
+                    #     self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
                     elif fn_name == "finalizar_llamada":
                         log.info("Finalizar llamada solicitada por el modelo")
@@ -1055,6 +1097,13 @@ class AvayaHandler:
                         }
                         log.info("→ SEND [bot.end ENDPOINT_RELEASED]")
                         self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
+
+                    elif fn_name == "iniciar_bloqueo_linea":
+                        numero = (fn_args.get("numero_telefono") or "").strip()
+                        log.info("Bloqueo de línea solicitado — numero=%s  call_id=%s", numero, call_id)
+                        self._tasks.append(asyncio.create_task(
+                            self._run_bloqueo_linea(numero, call_id)
+                        ))
 
                     else:
                         log.warning("Tool call con nombre no manejado: %s  args=%s",
@@ -1089,6 +1138,131 @@ class AvayaHandler:
             log.warning("_openai_send: WebSocket no abierto")
             return
         await self._openai_ws.send(json.dumps(msg))
+
+    async def _run_bloqueo_linea(self, numero: str, call_id: str | None) -> None:
+        """Llama a JourneyID y Twilio para iniciar el flujo de bloqueo de línea.
+
+        Ejecutado como tarea asyncio independiente — no bloquea el event loop de OpenAI.
+        En caso de cualquier error, inyecta un function_call_output de error y fuerza
+        una respuesta del bot para que informe al usuario.
+        """
+        async def _send_error(message: str) -> None:
+            await self._openai_send({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps({"status": "error", "message": message}),
+                },
+            })
+            await self._openai_send({
+                "type": "response.create",
+                "response": {
+                    "instructions": (
+                        "Ha ocurrido un error al iniciar el bloqueo. "
+                        "Discúlpate con el usuario y ofrécele transferirlo a un agente."
+                    )
+                },
+            })
+
+        if not numero.isdigit() or len(numero) != 10:
+            log.warning("_run_bloqueo_linea: número inválido '%s'", numero)
+            await _send_error(
+                f"Número de teléfono inválido: '{numero}'. Se requieren exactamente 10 dígitos."
+            )
+            return
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # ── 1. POST a JourneyID ──────────────────────────────────
+                journey_payload = {
+                    "pipelineKey": JOURNEYID_PIPELINE,
+                    "delivery": {"method": "url"},
+                    "customer": {"uniqueId": f"52{numero}"},
+                    "session": {"externalRef": self._session_id},
+                    "callbackUrls": [
+                        f"{JOURNEYID_CALLBACK_BASE}/api/callback/face/auth/journey/{self._session_id}"
+                    ],
+                    "language": "es-MX",
+                }
+                journey_headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {JOURNEYID_TOKEN}",
+                }
+                log.info("JourneyID POST — session=%s numero=%s", self._session_id, numero)
+                async with session.post(
+                    "https://app.journeyid.io/api/system/executions",
+                    json=journey_payload,
+                    headers=journey_headers,
+                ) as resp_j:
+                    j_status = resp_j.status
+                    j_body = await resp_j.json(content_type=None)
+                    log.info("JourneyID response — status=%d body=%s", j_status, j_body)
+
+                if j_status not in (200, 201):
+                    await _send_error(f"JourneyID devolvió status {j_status}.")
+                    return
+
+                # Intentar extraer la URL de autenticación (varía por versión de API)
+                auth_url = (
+                    j_body.get("url")
+                    or (j_body.get("delivery") or {}).get("url")
+                    or (j_body.get("data") or {}).get("url")
+                )
+                if not auth_url:
+                    log.error("JourneyID no devolvió URL de autenticación. body=%s", j_body)
+                    await _send_error("No se obtuvo la liga de autenticación de JourneyID.")
+                    return
+
+                log.info("JourneyID auth_url=%s", auth_url)
+
+                # ── 2. POST a Twilio (SMS) ───────────────────────────────
+                twilio_url = (
+                    f"https://api.twilio.com/2010-04-01/Accounts/"
+                    f"{TWILIO_ACCOUNT_SID}/Messages.json"
+                )
+                twilio_data = {
+                    "To": f"+52{numero}",
+                    "From": TWILIO_FROM_NUMBER,
+                    "Body": f"PoC ATT {auth_url}",
+                }
+                log.info("Twilio SMS POST — To=+52%s", numero)
+                async with session.post(
+                    twilio_url,
+                    data=twilio_data,
+                    auth=aiohttp.BasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                ) as resp_t:
+                    t_status = resp_t.status
+                    t_body = await resp_t.text()
+                    log.info("Twilio response — status=%d body=%s", t_status, t_body)
+
+                if t_status not in (200, 201):
+                    await _send_error(f"Twilio devolvió status {t_status} al enviar el SMS.")
+                    return
+
+                # ── 3. Informar al modelo que el SMS fue enviado ─────────
+                await self._openai_send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({
+                            "status": "sms_sent",
+                            "message": (
+                                "SMS enviado con éxito. Esperando autenticación. "
+                                "Pídele al usuario que revise su teléfono y te confirme "
+                                "cuando haya abierto la liga."
+                            ),
+                        }),
+                    },
+                })
+                await self._openai_send({"type": "response.create"})
+                log.info("Bloqueo iniciado — SMS enviado a +52%s", numero)
+
+        except Exception as exc:
+            log.error("_run_bloqueo_linea error: %s\n%s", exc, traceback.format_exc())
+            await _send_error("Error interno al procesar el bloqueo de línea.")
 
     async def _buffer_flush_loop(self) -> None:
         log.debug("Buffer flush loop started (interval=%.0f ms)", self.CHUNK_LENGTH_S * 1000)

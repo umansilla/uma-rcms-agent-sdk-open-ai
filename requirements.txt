@@ -17,3 +17,6 @@ python-dotenv==1.1.0
 
 # WebSocket transport for uvicorn
 websockets==14.1
+
+# Async HTTP client (JourneyID + Twilio API calls)
+aiohttp==3.10.10

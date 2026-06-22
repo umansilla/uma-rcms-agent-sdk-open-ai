@@ -35,15 +35,15 @@ except ImportError:
     pass
 
 import jwt
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
 if TYPE_CHECKING:
-    from .avaya_handler import AvayaHandler
+    from .avaya_handler import AvayaHandler, active_sessions as _active_sessions_type
 else:
     try:
-        from .avaya_handler import AvayaHandler
+        from .avaya_handler import AvayaHandler, active_sessions
     except ImportError:
-        from avaya_handler import AvayaHandler
+        from avaya_handler import AvayaHandler, active_sessions
 
 log = logging.getLogger("server")
 
@@ -82,6 +82,42 @@ app = FastAPI(
 @app.get("/")
 async def health_check():
     return {"status": "ok", "service": "Avaya RCMS → OpenAI Realtime"}
+
+
+@app.post("/api/callback/face/auth/journey/{session_id}")
+async def journey_callback(session_id: str, request: Request):
+    """Webhook recibido de JourneyID cuando el usuario completa (o falla) la autenticación."""
+    payload = await request.json()
+    status  = (payload.get("status") or "").lower()
+    log.info("JourneyID callback — session_id=%s status=%s payload=%s",
+             session_id, status, payload)
+
+    handler = active_sessions.get(session_id)
+    if handler is None:
+        log.warning("JourneyID callback para sesión desconocida o ya finalizada: %s", session_id)
+        return {"ok": True, "matched": False}
+
+    if status in ("success", "succeeded", "completed", "ok"):
+        prompt = (
+            "La autenticación fue EXITOSA. Procede inmediatamente a confirmar al usuario "
+            "que su línea ha sido bloqueada de manera segura."
+        )
+    else:
+        prompt = (
+            "La autenticación ha FALLADO o expirado. Infórmale al usuario que no se pudo "
+            "verificar su identidad y ofrécele transferirlo a un agente."
+        )
+
+    await handler._openai_send({
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_text", "text": prompt}],
+        },
+    })
+    await handler._openai_send({"type": "response.create"})
+    return {"ok": True, "matched": True}
 
 
 @app.websocket("/media-stream")
