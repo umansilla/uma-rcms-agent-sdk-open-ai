@@ -802,7 +802,7 @@ class AvayaHandler:
                     "Llama a esta función para iniciar el flujo de bloqueo seguro de una línea telefónica. "
                     "ANTES de llamarla, DEBES: (1) pedirle al usuario su número de teléfono a 10 dígitos, "
                     "(2) repetírselo y pedirle que lo confirme explícitamente. Solo cuando el usuario "
-                    "confirme el número procede a invocar la herramient; el sistema te indicará qué decir a continuación."
+                    "confirme el número procede a invocar la herramienta; No menciones más el sistema te indicará qué decir a continuación."
                 ),
                 "parameters": {
                     "type": "object",
