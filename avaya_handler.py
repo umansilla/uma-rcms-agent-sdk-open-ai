@@ -1200,7 +1200,7 @@ class AvayaHandler:
                     j_body = await resp_j.json(content_type=None)
                     log.info("JourneyID response — status=%d body=%s", j_status, j_body)
 
-                if j_status not in (200, 201, 206):
+                if j_status not in (200, 201, 260):
                     await _send_error(f"JourneyID devolvió status {j_status}.")
                     return
 
