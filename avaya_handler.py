@@ -769,21 +769,21 @@ class AvayaHandler:
                     "required": ["motivo"]
                 }
             },
-            # {
-            #     "type": "function",
-            #     "name": "iniciar_autenticacion",
-            #     "description": "Llama a esta función ESTRICTAMENTE SOLO UNA VEZ durante la conversación para solicitar la autenticación del usuario. NO la llames si el System Prompt indica que el usuario 'YA ESTÁ AUTENTICADO'. Si esta función ya fue ejecutada previamente en esta misma sesión, tienes prohibido volver a llamarla. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
-            #     "parameters": {
-            #         "type": "object",
-            #         "properties": {
-            #             "motivo": {
-            #                 "type": "string",
-            #                 "description": "El motivo por el cual se le pide al usuario que se autentique, usa solo una plabra para el motivo(ej. 'DATOS, BAJA, ALTA, COMPRA, BLOQUEAR')."
-            #             }
-            #         },
-            #         "required": ["motivo"]
-            #     }
-            # },
+            {
+                "type": "function",
+                "name": "consulta_saldo",
+                "description": "Llama a esta función cuando identifiques que el usuario desea consultar su saldo. IMPORTANTE: Llama a esta herramienta EN SILENCIO. NO generes ninguna respuesta",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "motivo": {
+                            "type": "string",
+                            "description": "El motivo por el cual se ejecuta esta herramienta es: 'SALDO'"
+                        }
+                    },
+                    "required": ["motivo"]
+                }
+            },
             {
                 "type": "function",
                 "name": "finalizar_llamada",
@@ -1056,28 +1056,28 @@ class AvayaHandler:
                         log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
                         self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
-                    # if fn_name == "iniciar_autenticacion":
-                    #     motivo = fn_args.get("motivo", "")
-                    #     log.info("Autenticación solicitada — motivo=%s", motivo)
-                    #     resp = {
-                    #         "version":     "1.0.0",
-                    #         "type":        "bot.feature",
-                    #         "sessionId":   self._session_id,
-                    #         "sequenceNum": self._next_json_seq(),
-                    #         "timestamp":   _iso_now(),
-                    #         "payload": {
-                    #             "ftype": "LIVE_AGENT_HANDOFF",
-                    #             "liveAgentHandoff": {
-                    #                 "context" : {
-                    #                     "agentic_term" : fn_name.upper(),
-                    #                     "agentic_reason" : motivo,
-                    #                 },
-                    #                 "queueId": "default-queue",
-                    #             },
-                    #         },
-                    #     }
-                    #     log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
-                    #     self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
+                    if fn_name == "consulta_saldo":
+                        motivo = fn_args.get("motivo", "")
+                        log.info("Autenticación solicitada — motivo=%s", motivo)
+                        resp = {
+                            "version":     "1.0.0",
+                            "type":        "bot.feature",
+                            "sessionId":   self._session_id,
+                            "sequenceNum": self._next_json_seq(),
+                            "timestamp":   _iso_now(),
+                            "payload": {
+                                "ftype": "LIVE_AGENT_HANDOFF",
+                                "liveAgentHandoff": {
+                                    "context" : {
+                                        "agentic_term" : fn_name.upper(),
+                                        "agentic_reason" : motivo,
+                                    },
+                                    "queueId": "default-queue",
+                                },
+                            },
+                        }
+                        log.info("→ SEND [bot.feature LIVE_AGENT_HANDOFF]")
+                        self._tasks.append(asyncio.create_task(self._send_delayed_action(resp, delay_seconds=2.5)))
 
                     elif fn_name == "finalizar_llamada":
                         log.info("Finalizar llamada solicitada por el modelo")
