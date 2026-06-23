@@ -821,8 +821,10 @@ class AvayaHandler:
                 "description": (
                     "Llama a esta función para iniciar el flujo de cambio de plan (up-selling) "
                     "para un cliente AT&T. ANTES de llamarla, DEBES: (1) pedirle al usuario su "
-                    "número de teléfono a 10 dígitos, (2) repetírselo y pedirle que lo confirme "
-                    "explícitamente. Solo cuando el usuario confirme el número procede a invocar "
+                    "número de teléfono a 10 dígitos, si el usuario ya ha proporcionado su número solo confirma el número, "
+                    "(2) repetírselo y pedirle que lo confirme explícitamente"
+                    "(3) Confirma el plan al que se desea cambiar el usuario AT&T Premium, AT&T Ilimitado, AT&T Lite o AT&T simple"
+                    ". Solo cuando el usuario confirme el número y el plan procede a invocar "
                     "la herramienta; el sistema te indicará qué decir a continuación."
                 ),
                 "parameters": {
@@ -1279,9 +1281,7 @@ class AvayaHandler:
                         "output": json.dumps({
                             "status": "sms_sent",
                             "message": (
-                                "SMS enviado con éxito. Esperando autenticación. "
-                                "Pídele al usuario que revise su teléfono y te confirme "
-                                "cuando haya abierto la liga."
+                                "Se ha enviado el SMS para autenticación con éxito. Esperando autenticación para continuar con el bloqueo de línea."
                             ),
                         }),
                     },
@@ -1403,9 +1403,8 @@ class AvayaHandler:
                         "output": json.dumps({
                             "status": "sms_sent",
                             "message": (
-                                "SMS enviado con éxito. Esperando confirmación de cambio de plan. "
-                                "Pídele al usuario que revise su teléfono y te confirme "
-                                "cuando haya abierto la liga."
+                                "Le he enviado el documento de cambio de plan con éxito. Esperando confirmación de cambio de plan. "
+                                "Estas en espera de que firme el documento, atiendelo en caso que tenga algúna duda con el plan AT&T Premium."
                             ),
                         }),
                     },
