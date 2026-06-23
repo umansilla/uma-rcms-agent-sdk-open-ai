@@ -137,6 +137,58 @@ async def journey_callback(session_id: str, request: Request):
     return {"ok": True, "matched": True}
 
 
+@app.post("/api/callback/cross/selling/journey/{session_id}")
+async def cross_selling_callback(session_id: str, request: Request):
+    """Webhook de JourneyID — se recibe cuando el usuario acepta el cambio de plan (up-selling)."""
+    payload = await request.json()
+    log.info("JourneyID cross-selling callback — session_id=%s payload=%s", session_id, payload)
+
+    handler = active_sessions.get(session_id)
+    if handler is None:
+        log.warning("Cross-selling callback para sesión desconocida o ya finalizada: %s", session_id)
+        return {"ok": True, "matched": False}
+
+    unique_id = (payload.get("user") or {}).get("uniqueId", "")
+
+    # PUT al API AT&T para registrar el cambio de plan
+    plan_ok = False
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.put(
+                "https://agreeable-rock-01678bd10.4.azurestaticapps.net/api/att/ivr/poc/saldos/plan/update",
+                json={"phoneNumber": unique_id},
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                plan_status = resp.status
+                plan_body   = await resp.text()
+                log.info("Plan update API — status=%d body=%s", plan_status, plan_body)
+                plan_ok = plan_status in (200, 201, 204)
+    except Exception as exc:
+        log.error("Error al llamar API de actualización de plan: %s", exc)
+
+    if plan_ok:
+        prompt = (
+            "El usuario completó y firmó el cambio de plan AT&T Premium exitosamente. "
+            "Confírmaselo, agradécele y pregúntale si necesita algo más."
+        )
+    else:
+        prompt = (
+            "El usuario completó la autenticación pero ocurrió un error al registrar el cambio de plan. "
+            "Infórmale e invítalo a intentarlo de nuevo o a comunicarse con un agente."
+        )
+
+    await handler._openai_send({
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "system",
+            "content": [{"type": "input_text", "text": prompt}],
+        },
+    })
+    await handler._openai_send({"type": "response.create"})
+    return {"ok": True, "matched": True}
+
+
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """Main WebSocket endpoint — Avaya Infinity connects here."""

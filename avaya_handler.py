@@ -42,8 +42,9 @@ log = logging.getLogger("avaya_bridge")
 # External API credentials / configuration
 # ─────────────────────────────────────────────────────────────────
 
-JOURNEYID_TOKEN         = os.getenv("JOURNEYID_TOKEN", "")
-JOURNEYID_PIPELINE      = os.getenv("JOURNEYID_PIPELINE_KEY", "ab48a335-1eed-4d0b-84e4-2d1cfa4e439f")
+JOURNEYID_TOKEN              = os.getenv("JOURNEYID_TOKEN", "")
+JOURNEYID_PIPELINE           = os.getenv("JOURNEYID_PIPELINE_KEY", "ab48a335-1eed-4d0b-84e4-2d1cfa4e439f")
+JOURNEYID_PIPELINE_UP_SELLING = os.getenv("JOURNEYID_PIPELINE_UP_SELLING", "")
 JOURNEYID_CALLBACK_BASE = os.getenv(
     "JOURNEYID_CALLBACK_BASE",
     "https://uma-rcms-agent-sdk-open-ai.onrender.com",
@@ -813,6 +814,27 @@ class AvayaHandler:
                     },
                     "required": ["numero_telefono"]
                 }
+            },
+            {
+                "type": "function",
+                "name": "iniciar_up_selling",
+                "description": (
+                    "Llama a esta función para iniciar el flujo de cambio de plan (up-selling) "
+                    "para un cliente AT&T. ANTES de llamarla, DEBES: (1) pedirle al usuario su "
+                    "número de teléfono a 10 dígitos, (2) repetírselo y pedirle que lo confirme "
+                    "explícitamente. Solo cuando el usuario confirme el número procede a invocar "
+                    "la herramienta; el sistema te indicará qué decir a continuación."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "numero_telefono": {
+                            "type": "string",
+                            "description": "Número de 10 dígitos confirmado por el usuario, solo dígitos, sin lada país."
+                        }
+                    },
+                    "required": ["numero_telefono"]
+                }
             }
             ],
             "tool_choice": "auto",
@@ -1105,6 +1127,13 @@ class AvayaHandler:
                             self._run_bloqueo_linea(numero, call_id)
                         ))
 
+                    elif fn_name == "iniciar_up_selling":
+                        numero = (fn_args.get("numero_telefono") or "").strip()
+                        log.info("Up-selling solicitado — numero=%s  call_id=%s", numero, call_id)
+                        self._tasks.append(asyncio.create_task(
+                            self._run_up_selling(numero, call_id)
+                        ))
+
                     else:
                         log.warning("Tool call con nombre no manejado: %s  args=%s",
                                     fn_name, fn_args)
@@ -1263,6 +1292,130 @@ class AvayaHandler:
         except Exception as exc:
             log.error("_run_bloqueo_linea error: %s\n%s", exc, traceback.format_exc())
             await _send_error("Error interno al procesar el bloqueo de línea.")
+
+    async def _run_up_selling(self, numero: str, call_id: str | None) -> None:
+        """Llama a JourneyID (pipeline up-selling) y Twilio para iniciar el flujo de cambio de plan.
+
+        Ejecutado como tarea asyncio independiente — no bloquea el event loop de OpenAI.
+        En caso de cualquier error, inyecta un function_call_output de error y fuerza
+        una respuesta del bot para que informe al usuario.
+        """
+        async def _send_error(message: str) -> None:
+            await self._openai_send({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps({"status": "error", "message": message}),
+                },
+            })
+            await self._openai_send({
+                "type": "response.create",
+                "response": {
+                    "instructions": (
+                        "Ha ocurrido un error al iniciar el cambio de plan. "
+                        "Discúlpate con el usuario y ofrécele transferirlo a un agente."
+                    )
+                },
+            })
+
+        if not numero.isdigit() or len(numero) != 10:
+            log.warning("_run_up_selling: número inválido '%s'", numero)
+            await _send_error(
+                f"Número de teléfono inválido: '{numero}'. Se requieren exactamente 10 dígitos."
+            )
+            return
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # ── 1. POST a JourneyID ──────────────────────────────────
+                journey_payload = {
+                    "pipelineKey": JOURNEYID_PIPELINE_UP_SELLING,
+                    "delivery": {"method": "url"},
+                    "customer": {"uniqueId": f"52{numero}"},
+                    "session": {"externalRef": self._session_id},
+                    "callbackUrls": [
+                        f"{JOURNEYID_CALLBACK_BASE}/api/callback/cross/selling/journey/{self._session_id}"
+                    ],
+                    "language": "es-MX",
+                }
+                journey_headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {JOURNEYID_TOKEN}",
+                }
+                log.info("JourneyID up-selling POST — session=%s numero=%s", self._session_id, numero)
+                async with session.post(
+                    "https://app.journeyid.io/api/system/executions",
+                    json=journey_payload,
+                    headers=journey_headers,
+                ) as resp_j:
+                    j_status = resp_j.status
+                    j_body = await resp_j.json(content_type=None)
+                    log.info("JourneyID up-selling response — status=%d body=%s", j_status, j_body)
+
+                if j_status not in (200, 201, 260):
+                    await _send_error(f"JourneyID devolvió status {j_status}.")
+                    return
+
+                auth_url = (
+                    j_body.get("url")
+                    or (j_body.get("delivery") or {}).get("url")
+                    or (j_body.get("data") or {}).get("url")
+                )
+                if not auth_url:
+                    log.error("JourneyID no devolvió URL de up-selling. body=%s", j_body)
+                    await _send_error("No se obtuvo la liga de cambio de plan de JourneyID.")
+                    return
+
+                log.info("JourneyID up-selling auth_url=%s", auth_url)
+
+                # ── 2. POST a Twilio (SMS) ───────────────────────────────
+                twilio_url = (
+                    f"https://api.twilio.com/2010-04-01/Accounts/"
+                    f"{TWILIO_ACCOUNT_SID}/Messages.json"
+                )
+                twilio_data = {
+                    "To": f"+52{numero}",
+                    "From": TWILIO_FROM_NUMBER,
+                    "Body": f"PoC ATT {auth_url}",
+                }
+                log.info("Twilio SMS up-selling POST — To=+52%s", numero)
+                async with session.post(
+                    twilio_url,
+                    data=twilio_data,
+                    auth=aiohttp.BasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                ) as resp_t:
+                    t_status = resp_t.status
+                    t_body = await resp_t.text()
+                    log.info("Twilio up-selling response — status=%d body=%s", t_status, t_body)
+
+                if t_status not in (200, 201):
+                    await _send_error(f"Twilio devolvió status {t_status} al enviar el SMS de cambio de plan.")
+                    return
+
+                # ── 3. Informar al modelo que el SMS fue enviado ─────────
+                await self._openai_send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({
+                            "status": "sms_sent",
+                            "message": (
+                                "SMS enviado con éxito. Esperando confirmación de cambio de plan. "
+                                "Pídele al usuario que revise su teléfono y te confirme "
+                                "cuando haya abierto la liga."
+                            ),
+                        }),
+                    },
+                })
+                await self._openai_send({"type": "response.create"})
+                log.info("Up-selling iniciado — SMS enviado a +52%s", numero)
+
+        except Exception as exc:
+            log.error("_run_up_selling error: %s\n%s", exc, traceback.format_exc())
+            await _send_error("Error interno al procesar el cambio de plan.")
 
     async def _buffer_flush_loop(self) -> None:
         log.debug("Buffer flush loop started (interval=%.0f ms)", self.CHUNK_LENGTH_S * 1000)
