@@ -34,6 +34,7 @@ try:
 except ImportError:
     pass
 
+import aiohttp
 import jwt
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 
@@ -86,26 +87,42 @@ async def health_check():
 
 @app.post("/api/callback/face/auth/journey/{session_id}")
 async def journey_callback(session_id: str, request: Request):
-    """Webhook recibido de JourneyID cuando el usuario completa (o falla) la autenticación."""
+    """Webhook de JourneyID — se recibe únicamente cuando la autenticación facial fue exitosa."""
     payload = await request.json()
-    status  = (payload.get("status") or "").lower()
-    log.info("JourneyID callback — session_id=%s status=%s payload=%s",
-             session_id, status, payload)
+    log.info("JourneyID callback — session_id=%s payload=%s", session_id, payload)
+
+    unique_id = (payload.get("user") or {}).get("uniqueId", "")
 
     handler = active_sessions.get(session_id)
     if handler is None:
         log.warning("JourneyID callback para sesión desconocida o ya finalizada: %s", session_id)
         return {"ok": True, "matched": False}
 
-    if status in ("success", "succeeded", "completed", "ok"):
+    # Llamar a la API de bloqueo con el uniqueId recibido de JourneyID
+    bloqueo_ok = False
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.put(
+                "https://agreeable-rock-01678bd10.4.azurestaticapps.net/api/att/ivr/poc/saldos/bloqueo/update",
+                json={"phoneNumber": unique_id},
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                bloqueo_status = resp.status
+                bloqueo_body   = await resp.text()
+                log.info("Bloqueo API — status=%d body=%s", bloqueo_status, bloqueo_body)
+                bloqueo_ok = bloqueo_status in (200, 201, 204)
+    except Exception as exc:
+        log.error("Error al llamar API de bloqueo: %s", exc)
+
+    if bloqueo_ok:
         prompt = (
-            "La autenticación fue EXITOSA. Procede inmediatamente a confirmar al usuario "
-            "que su línea ha sido bloqueada de manera segura."
+            "La autenticación facial fue EXITOSA y la línea ha sido bloqueada exitosamente. "
+            "Confírmale al usuario que su línea quedó bloqueada de manera segura y continúa con la conversación."
         )
     else:
         prompt = (
-            "La autenticación ha FALLADO o expirado. Infórmale al usuario que no se pudo "
-            "verificar su identidad y ofrécele transferirlo a un agente."
+            "La autenticación fue exitosa pero ocurrió un error al ejecutar el bloqueo de la línea. "
+            "Infórmale al usuario e invítalo a intentarlo de nuevo o a comunicarse con un agente."
         )
 
     await handler._openai_send({
